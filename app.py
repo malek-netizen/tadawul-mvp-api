@@ -62,13 +62,28 @@ def bollinger(close: pd.Series, window: int = 20, num_std: float = 2.0):
     lower = mid - num_std * std
     return upper, mid, lower
 
-def download_prices(ticker: str, period: str = "1y") -> pd.DataFrame:
-    df = yf.download(ticker, period=period, auto_adjust=False, progress=False)
-    if df is None or df.empty:
-        return pd.DataFrame()
-    df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-    df.dropna(inplace=True)
-    return df
+def download_prices(ticker: str, period: str = "2y") -> pd.DataFrame:
+    # تنظيف المدخل
+    t = ticker.strip().upper()
+
+    # قائمة محاولات
+    attempts = [t]
+    if not t.endswith(".SR"):
+        attempts.append(t + ".SR")
+    else:
+        attempts.append(t.replace(".SR", ""))  # جرب بدون لاحقة
+
+    for sym in attempts:
+        try:
+            df = yf.download(sym, period=period, auto_adjust=False, progress=False)
+            if df is not None and not df.empty:
+                df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+                df.dropna(inplace=True)
+                return df
+        except Exception:
+            continue
+
+    return pd.DataFrame()
 
 
 # -----------------------------
