@@ -5,12 +5,11 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 
-app = FastAPI(title="Tadawul MVP Technical Signal API", version="1.0")
+app = FastAPIfrom fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # مناسب لـ Thunkable
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
