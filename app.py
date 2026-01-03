@@ -2,15 +2,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 import pandas as pd
-import numpy as np
 import time
 import joblib
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# =========================
-# 1) إعداد FastAPI + CORS
-# =========================
 app = FastAPI(title="Tadawul MVP API", version="1.2.0")
 
 app.add_middleware(
@@ -23,36 +19,29 @@ app.add_middleware(
 MODEL_PATH = "model.joblib"
 TICKERS_PATH = "tickers_sa.txt"
 
-# ✅ Threshold الجديد (بدل 0.60)
-BUY_THRESHOLD = float(os.getenv("BUY_THRESHOLD", "0.30"))
+model = None           # will hold pipeline
+feature_cols = None
+meta = {"threshold": 0.60}
 
-model = None
-
-# =========================
-# 2) جلب الأسعار من Yahoo Chart (بديل yfinance)
-# =========================
+# ----------------------------
+# Yahoo Fetch
+# ----------------------------
 def fetch_yahoo_prices(ticker: str, range_: str = "1y", interval: str = "1d", min_rows: int = 60):
     bases = [
         "https://query1.finance.yahoo.com/v8/finance/chart/",
         "https://query2.finance.yahoo.com/v8/finance/chart/",
     ]
-
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/json",
         "Accept-Language": "en-US,en;q=0.9",
     }
 
-    for _attempt in range(3):
+    for _ in range(3):
         for base in bases:
             try:
                 url = f"{base}{ticker}"
-                r = requests.get(
-                    url,
-                    params={"range": range_, "interval": interval},
-                    headers=headers,
-                    timeout=20,
-                )
+                r = requests.get(url, params={"range": range_, "interval": interval}, headers=headers, timeout=20)
                 if r.status_code != 200:
                     continue
 
@@ -69,21 +58,16 @@ def fetch_yahoo_prices(ticker: str, range_: str = "1y", interval: str = "1d", mi
                 if not quote:
                     continue
 
-                df = pd.DataFrame(
-                    {
-                        "open": quote.get("open", []),
-                        "high": quote.get("high", []),
-                        "low": quote.get("low", []),
-                        "close": quote.get("close", []),
-                        "volume": quote.get("volume", []),
-                    }
-                )
-
-                df = df.dropna(subset=["close"]).reset_index(drop=True)
+                df = pd.DataFrame({
+                    "open": quote.get("open", []),
+                    "high": quote.get("high", []),
+                    "low": quote.get("low", []),
+                    "close": quote.get("close", []),
+                    "volume": quote.get("volume", []),
+                }).dropna(subset=["close"]).reset_index(drop=True)
 
                 if len(df) >= min_rows:
                     return df
-
             except Exception:
                 continue
 
@@ -91,14 +75,11 @@ def fetch_yahoo_prices(ticker: str, range_: str = "1y", interval: str = "1d", mi
 
     return None
 
-# =========================
-# 3) المؤشرات الفنية (بدون مكتبات إضافية)
-# =========================
-def sma(series, window):
-    return series.rolling(window).mean()
-
-def ema(series, span):
-    return series.ewm(span=span, adjust=False).mean()
+# ----------------------------
+# Indicators
+# ----------------------------
+def sma(series, window): return series.rolling(window).mean()
+def ema(series, span): return series.ewm(span=span, adjust=False).mean()
 
 def rsi(close, period=14):
     delta = close.diff()
@@ -127,12 +108,8 @@ def bollinger(close, window=20, num_std=2):
 def atr(high, low, close, period=14):
     prev_close = close.shift(1)
     tr = pd.concat(
-        [
-            (high - low),
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
+        [(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1
     ).max(axis=1)
     return tr.rolling(period).mean()
 
@@ -173,140 +150,107 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     d["vol_ma20"] = vol.rolling(20).mean()
     d["vol_ratio"] = vol / (d["vol_ma20"] + 1e-9)
 
-    d = d.dropna().reset_index(drop=True)
-    return d
+    return d.dropna().reset_index(drop=True)
 
-# =========================
-# 4) Feature vector للنموذج
-# =========================
-FEATURE_COLS = [
-    "sma10", "sma20", "sma50",
-    "ema10", "ema20", "ema50",
+DEFAULT_FEATURE_COLS = [
+    "sma10","sma20","sma50",
+    "ema10","ema20","ema50",
     "rsi14",
-    "macd", "macd_signal", "macd_hist",
+    "macd","macd_signal","macd_hist",
     "bb_width",
     "atr14",
-    "ret1", "ret5", "vol20",
+    "ret1","ret5","vol20",
     "vol_ratio",
 ]
 
 def latest_feature_vector(feat_df: pd.DataFrame):
-    row = feat_df.iloc[-1][FEATURE_COLS].astype(float)
+    cols = feature_cols or DEFAULT_FEATURE_COLS
+    row = feat_df.iloc[-1][cols].astype(float)
     X = row.values.reshape(1, -1)
-    return X, row.to_dict()
+    return X
 
-# =========================
-# 5) تحميل النموذج
-# =========================
+# ----------------------------
+# Load model at startup
+# ----------------------------
 @app.on_event("startup")
 def load_model():
-    global model
-    if os.path.exists(MODEL_PATH):
-        try:
-            model = joblib.load(MODEL_PATH)
-        except Exception:
-            model = None
-    else:
+    global model, feature_cols, meta
+    model = None
+    feature_cols = None
+    meta = {"threshold": 0.60}
+
+    if not os.path.exists(MODEL_PATH):
+        return
+
+    try:
+        payload = joblib.load(MODEL_PATH)
+        # payload can be either pipeline directly OR dict with keys
+        if isinstance(payload, dict) and "pipeline" in payload:
+            model = payload["pipeline"]
+            feature_cols = payload.get("feature_cols")
+            meta = payload.get("meta", meta)
+        else:
+            model = payload  # backward compat
+    except Exception:
         model = None
 
-# =========================
-# 6) Endpoints مساعدة
-# =========================
-@app.get("/health")
-def health():
-    return {
-        "status": "OK",
-        "model_loaded": bool(model),
-        "version": "v1-full",
-        "buy_threshold": BUY_THRESHOLD
-    }
-
-@app.get("/tickers_status")
-def tickers_status():
-    if not os.path.exists(TICKERS_PATH):
-        return {"exists": False, "path": TICKERS_PATH, "count": 0, "sample": []}
-
-    with open(TICKERS_PATH, "r", encoding="utf-8") as f:
-        tickers = [x.strip().upper() for x in f if x.strip()]
-
-    sample = tickers[:10]
-    return {
-        "exists": True,
-        "path": os.path.abspath(TICKERS_PATH),
-        "count": len(tickers),
-        "sample": sample
-    }
-
-@app.get("/debug_prices")
-def debug_prices(ticker: str):
-    t = ticker.strip().upper()
+# ----------------------------
+# Helpers
+# ----------------------------
+def normalize_ticker(t: str):
+    t = (t or "").strip().upper()
     if not t.endswith(".SR"):
         t += ".SR"
-    df = fetch_yahoo_prices(t, range_="1y", interval="1d")
-    if df is None:
-        return {"ticker": t, "ok": False, "rows": 0}
-    return {"ticker": t, "ok": True, "rows": int(len(df)), "last_close": float(df["close"].iloc[-1])}
+    return t
 
-# =========================
-# 7) منطق تحليل سهم واحد
-# =========================
+def rule_fallback(feat_df: pd.DataFrame):
+    entry = float(feat_df["close"].iloc[-1])
+    r = float(feat_df["rsi14"].iloc[-1])
+    mh = float(feat_df["macd_hist"].iloc[-1])
+    ema20_v = float(feat_df["ema20"].iloc[-1])
+    buy = (r < 70) and (mh > 0) and (entry > ema20_v)
+    prob = 0.55 if buy else 0.45
+    return buy, prob
+
 def analyze_one(ticker: str):
-    t = ticker.strip().upper()
-    if not t.endswith(".SR"):
-        t += ".SR"
+    t = normalize_ticker(ticker)
 
-    df = fetch_yahoo_prices(t, range_="1y", interval="1d")
+    df = fetch_yahoo_prices(t, range_="1y", interval="1d", min_rows=80)
     if df is None:
-        return {
-            "ticker": t,
-            "recommendation": "NO_TRADE",
-            "confidence": 0.0,
-            "reason": "No price data returned from provider."
-        }
+        return {"ticker": t, "recommendation": "NO_TRADE", "confidence": 0.0, "reason": "No price data returned from provider."}
 
     feat_df = build_features(df)
-    if len(feat_df) < 5:
-        return {
-            "ticker": t,
-            "recommendation": "NO_TRADE",
-            "confidence": 0.0,
-            "reason": "Not enough data after feature engineering."
-        }
+    if len(feat_df) < 30:
+        return {"ticker": t, "recommendation": "NO_TRADE", "confidence": 0.0, "reason": "Not enough data after feature engineering."}
 
     last_close = float(feat_df["close"].iloc[-1])
     entry = last_close
     take_profit = entry * 1.05
     stop_loss = entry * 0.98
 
-    # Fallback إذا النموذج غير موجود
-    if model is None:
-        r = float(feat_df["rsi14"].iloc[-1])
-        mh = float(feat_df["macd_hist"].iloc[-1])
-        ema20_v = float(feat_df["ema20"].iloc[-1])
-        buy = (r < 70) and (mh > 0) and (entry > ema20_v)
+    threshold = float(meta.get("threshold", 0.60))
 
+    if model is None:
+        buy, prob = rule_fallback(feat_df)
         return {
             "ticker": t,
             "recommendation": "BUY" if buy else "NO_TRADE",
-            "confidence": 0.55 if buy else 0.45,
+            "confidence": round(float(prob), 4),
             "entry": round(entry, 4),
             "take_profit": round(take_profit, 4),
             "stop_loss": round(stop_loss, 4),
-            "reason": "Fallback rule-based (model.joblib not found).",
+            "reason": "Fallback rule-based (model not loaded).",
             "last_close": round(last_close, 4),
         }
 
-    # نموذج ML
-    X, _ = latest_feature_vector(feat_df)
+    X = latest_feature_vector(feat_df)
     prob = float(model.predict_proba(X)[0, 1])
-
-    # ✅ Threshold هنا
-    recommendation = "BUY" if prob >= BUY_THRESHOLD else "NO_TRADE"
-    reason = "" if recommendation == "BUY" else "Probability below threshold"
+    rec = "BUY" if prob >= threshold else "NO_TRADE"
+    reason = "" if rec == "BUY" else f"Probability below threshold ({threshold})"
 
     return {
         "ticker": t,
-        "recommendation": recommendation,
+        "recommendation": rec,
         "confidence": round(prob, 4),
         "entry": round(entry, 4),
         "take_profit": round(take_profit, 4),
@@ -315,16 +259,6 @@ def analyze_one(ticker: str):
         "last_close": round(last_close, 4),
     }
 
-# =========================
-# 8) Endpoint الرئيسي
-# =========================
-@app.get("/predict")
-def predict(ticker: str):
-    return analyze_one(ticker)
-
-# =========================
-# 9) Top 10
-# =========================
 def load_tickers_from_file(path: str):
     if not os.path.exists(path):
         return []
@@ -337,17 +271,42 @@ def load_tickers_from_file(path: str):
             if not t.endswith(".SR"):
                 t += ".SR"
             items.append(t)
-
-    seen = set()
-    out = []
+    seen=set()
+    out=[]
     for x in items:
         if x not in seen:
             seen.add(x)
             out.append(x)
     return out
 
+# ----------------------------
+# Endpoints
+# ----------------------------
+@app.get("/health")
+def health():
+    return {"status": "OK", "model_loaded": bool(model), "version": "v1-ai", "threshold": meta.get("threshold", 0.60)}
+
+@app.get("/model_info")
+def model_info():
+    return {"model_loaded": bool(model), "feature_cols": feature_cols or DEFAULT_FEATURE_COLS, "meta": meta}
+
+@app.get("/tickers_status")
+def tickers_status():
+    exists = os.path.exists(TICKERS_PATH)
+    count = 0
+    sample = []
+    if exists:
+        tickers = load_tickers_from_file(TICKERS_PATH)
+        count = len(tickers)
+        sample = tickers[:10]
+    return {"exists": exists, "path": os.path.abspath(TICKERS_PATH), "count": count, "sample": sample}
+
+@app.get("/predict")
+def predict(ticker: str):
+    return analyze_one(ticker)
+
 @app.get("/top10")
-def top10(universe: str = "all", max_workers: int = 8):
+def top10(max_workers: int = 10):
     tickers = load_tickers_from_file(TICKERS_PATH)
     if not tickers:
         return {"items": [], "error": f"Tickers file not found or empty: {TICKERS_PATH}"}
@@ -363,18 +322,17 @@ def top10(universe: str = "all", max_workers: int = 8):
             except Exception:
                 errors += 1
 
+    # BUY first then confidence desc
     def score(item):
         rec = item.get("recommendation", "NO_TRADE")
         conf = float(item.get("confidence", 0.0) or 0.0)
         return (1 if rec == "BUY" else 0, conf)
 
     results_sorted = sorted(results, key=score, reverse=True)
-    top_items = results_sorted[:10]
-
     return {
-        "items": top_items,
+        "items": results_sorted[:10],
         "total": len(results),
         "errors": errors,
         "source": "tickers_sa.txt",
-        "note": f"Sorted by (BUY first) then confidence desc | threshold={BUY_THRESHOLD}"
+        "note": "Sorted by (BUY first) then confidence desc"
     }
