@@ -6,11 +6,12 @@ import numpy as np
 import time
 import joblib
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # =========================
 # 1) إعداد FastAPI + CORS
 # =========================
-app = FastAPI(title="Tadawul MVP API", version="1.0.0")
+app = FastAPI(title="Tadawul MVP API", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,12 +21,14 @@ app.add_middleware(
 )
 
 MODEL_PATH = "model.joblib"
+TICKERS_PATH = "tickers_sa.txt"
+
 model = None
 
 # =========================
 # 2) جلب الأسعار من Yahoo Chart (بديل yfinance)
 # =========================
-def fetch_yahoo_prices(ticker: str, range_: str = "1y", interval: str = "1d"):
+def fetch_yahoo_prices(ticker: str, range_: str = "1y", interval: str = "1d", min_rows: int = 60):
     """
     Fetch OHLCV data from Yahoo Finance chart endpoint with retries and fallback.
     Returns: DataFrame columns = open, high, low, close, volume
@@ -79,8 +82,8 @@ def fetch_yahoo_prices(ticker: str, range_: str = "1y", interval: str = "1d"):
 
                 df = df.dropna(subset=["close"]).reset_index(drop=True)
 
-                # نحتاج حد أدنى لحساب المؤشرات
-                if len(df) >= 120:
+                # ✅ كان 120 — صار 60 لتفادي فشل أسهم بياناتها أقل
+                if len(df) >= min_rows:
                     return df
 
             except Exception:
@@ -136,16 +139,12 @@ def atr(high, low, close, period=14):
     return tr.rolling(period).mean()
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    يأخذ OHLCV ويضيف مؤشرات فنية + خصائص رقمية.
-    """
     d = df.copy()
     close = d["close"]
     high = d["high"]
     low = d["low"]
     vol = d["volume"].fillna(0)
 
-    # مؤشرات الاتجاه
     d["sma10"] = sma(close, 10)
     d["sma20"] = sma(close, 20)
     d["sma50"] = sma(close, 50)
@@ -154,35 +153,28 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     d["ema20"] = ema(close, 20)
     d["ema50"] = ema(close, 50)
 
-    # RSI
     d["rsi14"] = rsi(close, 14)
 
-    # MACD
     macd_line, signal_line, hist = macd(close, 12, 26, 9)
     d["macd"] = macd_line
     d["macd_signal"] = signal_line
     d["macd_hist"] = hist
 
-    # Bollinger
     bb_u, bb_m, bb_l = bollinger(close, 20, 2)
     d["bb_upper"] = bb_u
     d["bb_mid"] = bb_m
     d["bb_lower"] = bb_l
     d["bb_width"] = (bb_u - bb_l) / (bb_m + 1e-9)
 
-    # ATR
     d["atr14"] = atr(high, low, close, 14)
 
-    # Returns / Volatility
     d["ret1"] = close.pct_change(1)
     d["ret5"] = close.pct_change(5)
     d["vol20"] = d["ret1"].rolling(20).std()
 
-    # حجم
     d["vol_ma20"] = vol.rolling(20).mean()
     d["vol_ratio"] = vol / (d["vol_ma20"] + 1e-9)
 
-    # تنظيف
     d = d.dropna().reset_index(drop=True)
     return d
 
@@ -237,10 +229,9 @@ def debug_prices(ticker: str):
     return {"ticker": t, "ok": True, "rows": int(len(df)), "last_close": float(df["close"].iloc[-1])}
 
 # =========================
-# 7) Endpoint الرئيسي للتطبيق
+# 7) منطق تحليل سهم واحد (نفس /predict) — مفصول لإعادة الاستخدام
 # =========================
-@app.get("/predict")
-def predict(ticker: str):
+def analyze_one(ticker: str):
     t = ticker.strip().upper()
     if not t.endswith(".SR"):
         t += ".SR"
@@ -265,19 +256,16 @@ def predict(ticker: str):
 
     last_close = float(feat_df["close"].iloc[-1])
     entry = last_close
-
-    # مستويات TP/SL (كنسبة ثابتة مثل البحث)
     take_profit = entry * 1.05
     stop_loss = entry * 0.98
 
-    # إذا النموذج غير موجود → fallback Rule-based بسيط
+    # Fallback إذا النموذج غير موجود
     if model is None:
-        # قاعدة بسيطة: RSI < 70 و MACD hist موجب و السعر فوق EMA20
         r = float(feat_df["rsi14"].iloc[-1])
         mh = float(feat_df["macd_hist"].iloc[-1])
         ema20_v = float(feat_df["ema20"].iloc[-1])
-
         buy = (r < 70) and (mh > 0) and (entry > ema20_v)
+
         return {
             "ticker": t,
             "recommendation": "BUY" if buy else "NO_TRADE",
@@ -293,7 +281,6 @@ def predict(ticker: str):
     X, _ = latest_feature_vector(feat_df)
     prob = float(model.predict_proba(X)[0, 1])  # احتمال BUY
     recommendation = "BUY" if prob >= 0.60 else "NO_TRADE"
-
     reason = "" if recommendation == "BUY" else "Probability below threshold"
 
     return {
@@ -305,4 +292,76 @@ def predict(ticker: str):
         "stop_loss": round(stop_loss, 4),
         "reason": reason,
         "last_close": round(last_close, 4),
+    }
+
+# =========================
+# 8) Endpoint الرئيسي للتطبيق
+# =========================
+@app.get("/predict")
+def predict(ticker: str):
+    return analyze_one(ticker)
+
+# =========================
+# 9) Endpoint: Top 10
+# =========================
+def load_tickers_from_file(path: str):
+    if not os.path.exists(path):
+        return []
+    items = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            t = line.strip().upper()
+            if not t:
+                continue
+            # نتأكد من .SR
+            if not t.endswith(".SR"):
+                t += ".SR"
+            items.append(t)
+    # إزالة التكرار مع الحفاظ على الترتيب
+    seen = set()
+    out = []
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+@app.get("/top10")
+def top10(universe: str = "all", max_workers: int = 8):
+    """
+    يقرأ tickers_sa.txt ويحلل كل الأسهم (بشكل متوازي محدود)
+    ويرجع أفضل 10 حسب confidence.
+    """
+    tickers = load_tickers_from_file(TICKERS_PATH)
+    if not tickers:
+        return {"items": [], "error": f"Tickers file not found or empty: {TICKERS_PATH}"}
+
+    results = []
+    errors = 0
+
+    # تنفيذ متوازي محدود
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(analyze_one, t): t for t in tickers}
+        for fut in as_completed(futures):
+            try:
+                r = fut.result()
+                results.append(r)
+            except Exception:
+                errors += 1
+
+    # نرتب: أولاً BUY ثم confidence الأعلى
+    def score(item):
+        rec = item.get("recommendation", "NO_TRADE")
+        conf = float(item.get("confidence", 0.0) or 0.0)
+        return (1 if rec == "BUY" else 0, conf)
+
+    results_sorted = sorted(results, key=score, reverse=True)
+    top_items = results_sorted[:10]
+
+    return {
+        "items": top_items,
+        "total": len(results),
+        "errors": errors,
+        "source": "tickers_sa.txt",
+        "note": "Sorted by (BUY first) then confidence desc"
     }
