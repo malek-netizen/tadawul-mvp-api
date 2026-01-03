@@ -3,9 +3,6 @@ name: Train Model (Tadawul)
 on:
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
   train:
     runs-on: ubuntu-latest
@@ -17,7 +14,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
@@ -28,11 +25,9 @@ jobs:
         run: |
           python train_model.py
 
-      - name: Commit model.joblib if changed
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add model.joblib
-          git status
-          git commit -m "Update model.joblib (auto-trained)" || echo "No changes to commit"
-          git push
+      # ⭐⭐ هذا هو الجزء المهم ⭐⭐
+      - name: Upload trained model
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-joblib
+          path: model.joblib
