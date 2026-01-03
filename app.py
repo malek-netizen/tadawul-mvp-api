@@ -9,9 +9,19 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # =========================
-# 1) إعداد FastAPI + CORS
+# 0) Paths (IMPORTANT on Render)
 # =========================
-app = FastAPI(title="Tadawul MVP API", version="1.1.0")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+MODEL_PATH = os.path.join(BASE_DIR, "model.joblib")
+TICKERS_PATH = os.path.join(BASE_DIR, "tickers_sa.txt")
+
+model = None
+
+# =========================
+# 1) FastAPI + CORS
+# =========================
+app = FastAPI(title="Tadawul MVP API", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,15 +30,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MODEL_PATH = "model.joblib"
-TICKERS_PATH = "tickers_sa.txt"
-
-model = None
-
 # =========================
-# 2) جلب الأسعار من Yahoo Chart (بديل yfinance)
+# 2) Yahoo Chart Fetch (robust)
 # =========================
-def fetch_yahoo_prices(ticker: str, range_: str = "1y", interval: str = "1d", min_rows: int = 60):
+def fetch_yahoo_prices(
+    ticker: str,
+    range_: str = "1y",
+    interval: str = "1d",
+    min_rows: int = 60,
+):
     """
     Fetch OHLCV data from Yahoo Finance chart endpoint with retries and fallback.
     Returns: DataFrame columns = open, high, low, close, volume
@@ -44,7 +54,7 @@ def fetch_yahoo_prices(ticker: str, range_: str = "1y", interval: str = "1d", mi
         "Accept-Language": "en-US,en;q=0.9",
     }
 
-    for attempt in range(3):
+    for _attempt in range(3):
         for base in bases:
             try:
                 url = f"{base}{ticker}"
@@ -54,6 +64,7 @@ def fetch_yahoo_prices(ticker: str, range_: str = "1y", interval: str = "1d", mi
                     headers=headers,
                     timeout=20,
                 )
+
                 if r.status_code != 200:
                     continue
 
@@ -82,7 +93,6 @@ def fetch_yahoo_prices(ticker: str, range_: str = "1y", interval: str = "1d", mi
 
                 df = df.dropna(subset=["close"]).reset_index(drop=True)
 
-                # ✅ كان 120 — صار 60 لتفادي فشل أسهم بياناتها أقل
                 if len(df) >= min_rows:
                     return df
 
@@ -94,7 +104,7 @@ def fetch_yahoo_prices(ticker: str, range_: str = "1y", interval: str = "1d", mi
     return None
 
 # =========================
-# 3) حساب المؤشرات الفنية (بدون مكتبات إضافية)
+# 3) Indicators (no extra libs)
 # =========================
 def sma(series, window):
     return series.rolling(window).mean()
@@ -129,11 +139,7 @@ def bollinger(close, window=20, num_std=2):
 def atr(high, low, close, period=14):
     prev_close = close.shift(1)
     tr = pd.concat(
-        [
-            (high - low),
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
+        [(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
         axis=1,
     ).max(axis=1)
     return tr.rolling(period).mean()
@@ -145,6 +151,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     low = d["low"]
     vol = d["volume"].fillna(0)
 
+    # Trend / MAs
     d["sma10"] = sma(close, 10)
     d["sma20"] = sma(close, 20)
     d["sma50"] = sma(close, 50)
@@ -153,33 +160,40 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     d["ema20"] = ema(close, 20)
     d["ema50"] = ema(close, 50)
 
+    # RSI
     d["rsi14"] = rsi(close, 14)
 
+    # MACD
     macd_line, signal_line, hist = macd(close, 12, 26, 9)
     d["macd"] = macd_line
     d["macd_signal"] = signal_line
     d["macd_hist"] = hist
 
+    # Bollinger
     bb_u, bb_m, bb_l = bollinger(close, 20, 2)
     d["bb_upper"] = bb_u
     d["bb_mid"] = bb_m
     d["bb_lower"] = bb_l
     d["bb_width"] = (bb_u - bb_l) / (bb_m + 1e-9)
 
+    # ATR
     d["atr14"] = atr(high, low, close, 14)
 
+    # Returns / Vol
     d["ret1"] = close.pct_change(1)
     d["ret5"] = close.pct_change(5)
     d["vol20"] = d["ret1"].rolling(20).std()
 
+    # Volume features
     d["vol_ma20"] = vol.rolling(20).mean()
     d["vol_ratio"] = vol / (d["vol_ma20"] + 1e-9)
 
+    # Clean
     d = d.dropna().reset_index(drop=True)
     return d
 
 # =========================
-# 4) تحويل آخر صف Features إلى Vector للنموذج
+# 4) Feature vector
 # =========================
 FEATURE_COLS = [
     "sma10", "sma20", "sma50",
@@ -198,7 +212,7 @@ def latest_feature_vector(feat_df: pd.DataFrame):
     return X, row.to_dict()
 
 # =========================
-# 5) تحميل النموذج عند بدء التشغيل
+# 5) Load model on startup
 # =========================
 @app.on_event("startup")
 def load_model():
@@ -212,11 +226,11 @@ def load_model():
         model = None
 
 # =========================
-# 6) Endpoints مساعدة
+# 6) Health + Debug
 # =========================
 @app.get("/health")
 def health():
-    return {"status": "OK", "model_loaded": bool(model), "version": "v1-full"}
+    return {"status": "OK", "model_loaded": bool(model), "version": app.version}
 
 @app.get("/debug_prices")
 def debug_prices(ticker: str):
@@ -226,13 +240,41 @@ def debug_prices(ticker: str):
     df = fetch_yahoo_prices(t, range_="1y", interval="1d")
     if df is None:
         return {"ticker": t, "ok": False, "rows": 0}
-    return {"ticker": t, "ok": True, "rows": int(len(df)), "last_close": float(df["close"].iloc[-1])}
+    return {
+        "ticker": t,
+        "ok": True,
+        "rows": int(len(df)),
+        "last_close": float(df["close"].iloc[-1]),
+    }
+
+@app.get("/debug_tickers")
+def debug_tickers():
+    if not os.path.exists(TICKERS_PATH):
+        return {"exists": False, "path": TICKERS_PATH}
+
+    with open(TICKERS_PATH, "r", encoding="utf-8") as f:
+        lines = [x.strip() for x in f.read().splitlines() if x.strip()]
+
+    return {
+        "exists": True,
+        "path": TICKERS_PATH,
+        "count": len(lines),
+        "sample": lines[:10],
+    }
 
 # =========================
-# 7) منطق تحليل سهم واحد (نفس /predict) — مفصول لإعادة الاستخدام
+# 7) Analyze one ticker (reusable)
 # =========================
 def analyze_one(ticker: str):
-    t = ticker.strip().upper()
+    t = (ticker or "").strip().upper()
+    if not t:
+        return {
+            "ticker": "",
+            "recommendation": "NO_TRADE",
+            "confidence": 0.0,
+            "reason": "Empty ticker.",
+        }
+
     if not t.endswith(".SR"):
         t += ".SR"
 
@@ -242,7 +284,7 @@ def analyze_one(ticker: str):
             "ticker": t,
             "recommendation": "NO_TRADE",
             "confidence": 0.0,
-            "reason": "No price data returned from provider."
+            "reason": "No price data returned from provider.",
         }
 
     feat_df = build_features(df)
@@ -251,7 +293,7 @@ def analyze_one(ticker: str):
             "ticker": t,
             "recommendation": "NO_TRADE",
             "confidence": 0.0,
-            "reason": "Not enough data after feature engineering."
+            "reason": "Not enough data after feature engineering.",
         }
 
     last_close = float(feat_df["close"].iloc[-1])
@@ -259,7 +301,7 @@ def analyze_one(ticker: str):
     take_profit = entry * 1.05
     stop_loss = entry * 0.98
 
-    # Fallback إذا النموذج غير موجود
+    # Fallback if model missing
     if model is None:
         r = float(feat_df["rsi14"].iloc[-1])
         mh = float(feat_df["macd_hist"].iloc[-1])
@@ -277,9 +319,13 @@ def analyze_one(ticker: str):
             "last_close": round(last_close, 4),
         }
 
-    # نموذج ML
+    # ML model
     X, _ = latest_feature_vector(feat_df)
-    prob = float(model.predict_proba(X)[0, 1])  # احتمال BUY
+    try:
+        prob = float(model.predict_proba(X)[0, 1])
+    except Exception:
+        prob = 0.0
+
     recommendation = "BUY" if prob >= 0.60 else "NO_TRADE"
     reason = "" if recommendation == "BUY" else "Probability below threshold"
 
@@ -295,29 +341,30 @@ def analyze_one(ticker: str):
     }
 
 # =========================
-# 8) Endpoint الرئيسي للتطبيق
+# 8) /predict
 # =========================
 @app.get("/predict")
 def predict(ticker: str):
     return analyze_one(ticker)
 
 # =========================
-# 9) Endpoint: Top 10
+# 9) Tickers file loader + /top10
 # =========================
 def load_tickers_from_file(path: str):
     if not os.path.exists(path):
         return []
+
     items = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             t = line.strip().upper()
             if not t:
                 continue
-            # نتأكد من .SR
             if not t.endswith(".SR"):
                 t += ".SR"
             items.append(t)
-    # إزالة التكرار مع الحفاظ على الترتيب
+
+    # dedupe preserving order
     seen = set()
     out = []
     for x in items:
@@ -327,19 +374,24 @@ def load_tickers_from_file(path: str):
     return out
 
 @app.get("/top10")
-def top10(universe: str = "all", max_workers: int = 8):
+def top10(universe: str = "all", max_workers: int = 8, limit_universe: int = 0):
     """
-    يقرأ tickers_sa.txt ويحلل كل الأسهم (بشكل متوازي محدود)
-    ويرجع أفضل 10 حسب confidence.
+    Reads tickers_sa.txt and analyzes tickers with limited parallelism.
+    Returns top 10 sorted by (BUY first, then confidence desc).
+    Optional:
+      - max_workers: threads used
+      - limit_universe: if >0, analyze only first N tickers (useful to avoid Yahoo rate limits)
     """
     tickers = load_tickers_from_file(TICKERS_PATH)
     if not tickers:
         return {"items": [], "error": f"Tickers file not found or empty: {TICKERS_PATH}"}
 
+    if limit_universe and limit_universe > 0:
+        tickers = tickers[: int(limit_universe)]
+
     results = []
     errors = 0
 
-    # تنفيذ متوازي محدود
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {ex.submit(analyze_one, t): t for t in tickers}
         for fut in as_completed(futures):
@@ -349,7 +401,6 @@ def top10(universe: str = "all", max_workers: int = 8):
             except Exception:
                 errors += 1
 
-    # نرتب: أولاً BUY ثم confidence الأعلى
     def score(item):
         rec = item.get("recommendation", "NO_TRADE")
         conf = float(item.get("confidence", 0.0) or 0.0)
@@ -362,6 +413,6 @@ def top10(universe: str = "all", max_workers: int = 8):
         "items": top_items,
         "total": len(results),
         "errors": errors,
-        "source": "tickers_sa.txt",
-        "note": "Sorted by (BUY first) then confidence desc"
+        "source": os.path.basename(TICKERS_PATH),
+        "note": "Sorted by (BUY first) then confidence desc",
     }
