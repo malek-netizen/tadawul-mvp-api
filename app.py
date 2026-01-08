@@ -2,12 +2,18 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 import pandas as pd
+import numpy as np
 import time
 import joblib
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-app = FastAPI(title="Tadawul MVP API", version="1.2.0")
+# =========================
+# Tadawul MVP API (Rules v1.0)
+# هدف: +5% | وقف: -2% | تاسي فقط
+# =========================
+
+app = FastAPI(title="Tadawul MVP API", version="2.0.0-rules-v1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,15 +24,36 @@ app.add_middleware(
 
 MODEL_PATH = "model.joblib"
 TICKERS_PATH = "tickers_sa.txt"
+model = None
 
-model = None           # will hold pipeline
-feature_cols = None
-meta = {"threshold": 0.60}
+# =========================
+# إعدادات النظام (تقدر تعدلها لاحقًا)
+# =========================
+TP_PCT = 0.05
+SL_PCT = 0.02
 
-# ----------------------------
-# Yahoo Fetch
-# ----------------------------
-def fetch_yahoo_prices(ticker: str, range_: str = "1y", interval: str = "1d", min_rows: int = 60):
+# فلترة RSI
+RSI_MIN = 40
+RSI_MAX = 65
+RSI_OVERBOUGHT = 70
+
+# قرب السعر من المتوسطات
+MAX_ABOVE_EMA20 = 0.06   # 6% فوق EMA20 = مبالغة غالباً
+MAX_ABOVE_EMA50 = 0.08   # 8% فوق EMA50
+
+# فلترة الاندفاع (شمعة قوية بدون تماسك)
+SPIKE_RET1 = 0.08        # 8% يوم واحد تعتبر اندفاع قوي
+CONSOL_DAYS = 4
+CONSOL_RANGE_MAX = 0.06  # تماسك = مدى 4 أيام <= 6%
+
+# فلترة الهبوط/كسر قاع (اتجاه سلبي نشط)
+LOOKBACK_LOW_DAYS = 10
+MIN_TREND_SCORE = 2      # لازم يحقق حد أدنى من شروط الاتجاه
+
+# =========================
+# 1) جلب الأسعار من Yahoo Chart
+# =========================
+def fetch_yahoo_prices(ticker: str, range_: str = "1y", interval: str = "1d", min_rows: int = 80):
     bases = [
         "https://query1.finance.yahoo.com/v8/finance/chart/",
         "https://query2.finance.yahoo.com/v8/finance/chart/",
@@ -41,7 +68,12 @@ def fetch_yahoo_prices(ticker: str, range_: str = "1y", interval: str = "1d", mi
         for base in bases:
             try:
                 url = f"{base}{ticker}"
-                r = requests.get(url, params={"range": range_, "interval": interval}, headers=headers, timeout=20)
+                r = requests.get(
+                    url,
+                    params={"range": range_, "interval": interval},
+                    headers=headers,
+                    timeout=20,
+                )
                 if r.status_code != 200:
                     continue
 
@@ -58,28 +90,34 @@ def fetch_yahoo_prices(ticker: str, range_: str = "1y", interval: str = "1d", mi
                 if not quote:
                     continue
 
-                df = pd.DataFrame({
-                    "open": quote.get("open", []),
-                    "high": quote.get("high", []),
-                    "low": quote.get("low", []),
-                    "close": quote.get("close", []),
-                    "volume": quote.get("volume", []),
-                }).dropna(subset=["close"]).reset_index(drop=True)
+                df = pd.DataFrame(
+                    {
+                        "open": quote.get("open", []),
+                        "high": quote.get("high", []),
+                        "low": quote.get("low", []),
+                        "close": quote.get("close", []),
+                        "volume": quote.get("volume", []),
+                    }
+                )
 
+                df = df.dropna(subset=["close"]).reset_index(drop=True)
                 if len(df) >= min_rows:
                     return df
+
             except Exception:
                 continue
-
         time.sleep(1)
 
     return None
 
-# ----------------------------
-# Indicators
-# ----------------------------
-def sma(series, window): return series.rolling(window).mean()
-def ema(series, span): return series.ewm(span=span, adjust=False).mean()
+# =========================
+# 2) مؤشرات فنية (بدون مكتبات إضافية)
+# =========================
+def sma(series, window):
+    return series.rolling(window).mean()
+
+def ema(series, span):
+    return series.ewm(span=span, adjust=False).mean()
 
 def rsi(close, period=14):
     delta = close.diff()
@@ -109,7 +147,7 @@ def atr(high, low, close, period=14):
     prev_close = close.shift(1)
     tr = pd.concat(
         [(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
-        axis=1
+        axis=1,
     ).max(axis=1)
     return tr.rolling(period).mean()
 
@@ -144,114 +182,270 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     d["atr14"] = atr(high, low, close, 14)
 
     d["ret1"] = close.pct_change(1)
+    d["ret3"] = close.pct_change(3)
     d["ret5"] = close.pct_change(5)
     d["vol20"] = d["ret1"].rolling(20).std()
 
     d["vol_ma20"] = vol.rolling(20).mean()
     d["vol_ratio"] = vol / (d["vol_ma20"] + 1e-9)
 
-    return d.dropna().reset_index(drop=True)
+    d = d.dropna().reset_index(drop=True)
+    return d
 
-DEFAULT_FEATURE_COLS = [
-    "sma10","sma20","sma50",
-    "ema10","ema20","ema50",
+FEATURE_COLS = [
+    "sma10", "sma20", "sma50",
+    "ema10", "ema20", "ema50",
     "rsi14",
-    "macd","macd_signal","macd_hist",
+    "macd", "macd_signal", "macd_hist",
     "bb_width",
     "atr14",
-    "ret1","ret5","vol20",
+    "ret1", "ret3", "ret5", "vol20",
     "vol_ratio",
 ]
 
 def latest_feature_vector(feat_df: pd.DataFrame):
-    cols = feature_cols or DEFAULT_FEATURE_COLS
-    row = feat_df.iloc[-1][cols].astype(float)
+    row = feat_df.iloc[-1][FEATURE_COLS].astype(float)
     X = row.values.reshape(1, -1)
-    return X
+    return X, row.to_dict()
 
-# ----------------------------
-# Load model at startup
-# ----------------------------
+# =========================
+# 3) تحميل النموذج
+# =========================
 @app.on_event("startup")
 def load_model():
-    global model, feature_cols, meta
-    model = None
-    feature_cols = None
-    meta = {"threshold": 0.60}
-
-    if not os.path.exists(MODEL_PATH):
-        return
-
-    try:
-        payload = joblib.load(MODEL_PATH)
-        # payload can be either pipeline directly OR dict with keys
-        if isinstance(payload, dict) and "pipeline" in payload:
-            model = payload["pipeline"]
-            feature_cols = payload.get("feature_cols")
-            meta = payload.get("meta", meta)
-        else:
-            model = payload  # backward compat
-    except Exception:
+    global model
+    if os.path.exists(MODEL_PATH):
+        try:
+            model = joblib.load(MODEL_PATH)
+        except Exception:
+            model = None
+    else:
         model = None
 
-# ----------------------------
-# Helpers
-# ----------------------------
-def normalize_ticker(t: str):
-    t = (t or "").strip().upper()
+# =========================
+# 4) قواعد الدخول (Rules v1.0)
+# =========================
+def is_consolidating(d: pd.DataFrame, days: int = CONSOL_DAYS) -> bool:
+    if len(d) < days + 5:
+        return False
+    last = d.tail(days)
+    hi = float(last["high"].max())
+    lo = float(last["low"].min())
+    mid = float(last["close"].mean())
+    if mid <= 0:
+        return False
+    rng = (hi - lo) / mid
+    return rng <= CONSOL_RANGE_MAX
+
+def trend_score(d: pd.DataFrame) -> int:
+    # نقاط بسيطة لتجنب الاتجاه الهابط النشط
+    # نستخدم آخر صف (آخر يوم)
+    last = d.iloc[-1]
+    score = 0
+
+    close = float(last["close"])
+    ema20 = float(last["ema20"])
+    ema50 = float(last["ema50"])
+    r5 = float(last["ret5"])
+    mh = float(last["macd_hist"])
+
+    # 1) close فوق ema20
+    if close >= ema20:
+        score += 1
+
+    # 2) ema20 فوق ema50 (مستحسن)
+    if ema20 >= ema50:
+        score += 1
+
+    # 3) ret5 ليست سلبية قوية
+    if r5 > -0.03:
+        score += 1
+
+    # 4) macd_hist ليس سلبي متدهور
+    if mh >= -0.001:
+        score += 1
+
+    return score
+
+def broke_recent_low(df_ohlc: pd.DataFrame, lookback: int = LOOKBACK_LOW_DAYS) -> bool:
+    if len(df_ohlc) < lookback + 5:
+        return False
+    recent = df_ohlc.tail(lookback)
+    recent_low = float(recent["low"].min())
+    last_close = float(df_ohlc["close"].iloc[-1])
+    # كسر قاع إذا الإغلاق أقل من القاع بنطاق بسيط
+    return last_close < recent_low * 0.995
+
+def spike_without_base(d: pd.DataFrame) -> bool:
+    # اندفاع قوي في آخر يوم مع غياب التماسك
+    last = d.iloc[-1]
+    ret1 = float(last["ret1"])
+    if ret1 >= SPIKE_RET1 and (not is_consolidating(d, CONSOL_DAYS)):
+        return True
+    return False
+
+def risk_check_stop(df_ohlc: pd.DataFrame, entry: float, stop: float) -> bool:
+    # الوقف ثابت -2%. نرفض لو كان السهم مؤخراً ينزل تحت الوقف بسهولة (وقف ضيق جداً)
+    if len(df_ohlc) < 10:
+        return False
+    recent = df_ohlc.tail(5)
+    recent_low = float(recent["low"].min())
+    # إذا كان القاع آخر 5 أيام أقل من الوقف -> احتمال ضرب الوقف عالي جداً
+    if recent_low < stop:
+        return False
+    return True
+
+def passes_rules(df_ohlc: pd.DataFrame, feat: pd.DataFrame):
+    """
+    يرجع (ok:bool, reasons:list[str])
+    """
+    reasons = []
+    d = feat
+
+    last = d.iloc[-1]
+    close = float(last["close"])
+    ema20 = float(last["ema20"])
+    ema50 = float(last["ema50"])
+    rsi14 = float(last["rsi14"])
+
+    # 1) منع الاتجاه الهابط النشط / كسر القاع
+    if broke_recent_low(df_ohlc, LOOKBACK_LOW_DAYS):
+        reasons.append("Rejected: recent low broken (bearish context).")
+
+    ts = trend_score(d)
+    if ts < MIN_TREND_SCORE:
+        reasons.append("Rejected: weak trend context (down/weak structure).")
+
+    # 2) منع الاندفاع بدون تماسك (مثل قفزة مفاجئة)
+    if spike_without_base(d):
+        reasons.append("Rejected: strong 1-day spike without consolidation (chasing).")
+
+    # 3) RSI فلترة
+    if rsi14 > RSI_OVERBOUGHT:
+        reasons.append("Rejected: RSI overbought (>70).")
+    if not (RSI_MIN <= rsi14 <= RSI_MAX):
+        # استثناء: إذا RSI خرج من منطقة منخفضة مع تماسك
+        # (يعني RSI الآن 35-40 تقريباً) + تماسك موجود
+        if not (rsi14 >= 35 and is_consolidating(d, CONSOL_DAYS)):
+            reasons.append("Rejected: RSI not in safe band (40-65) and no consolidation exception.")
+
+    # 4) قرب السعر من المتوسطات (لا نريد مبالغة)
+    if ema20 > 0 and (close - ema20) / ema20 > MAX_ABOVE_EMA20:
+        reasons.append("Rejected: price too far above EMA20 (overextended).")
+    if ema50 > 0 and (close - ema50) / ema50 > MAX_ABOVE_EMA50:
+        reasons.append("Rejected: price too far above EMA50 (overextended).")
+
+    # 5) MACD تحسّن تدريجي (ليس قرار وحده)
+    # نطلب histogram يتحسن آخر 3 أيام أو على الأقل غير سلبي بقوة
+    if len(d) >= 4:
+        h = d["macd_hist"].tail(4).values
+        if not (h[-1] >= h[-2] or h[-1] >= 0):
+            reasons.append("Rejected: MACD histogram not improving.")
+
+    # 6) شرط وجود "base" / تماسك (لتقليل الإشارات الخاطئة)
+    # نسمح بعدم وجود تماسك فقط إذا لم يكن هناك اندفاع وكان الاتجاه جيد جدًا
+    base_ok = is_consolidating(d, CONSOL_DAYS)
+    if not base_ok and ts < 3:
+        reasons.append("Rejected: no clear consolidation/base before entry.")
+
+    ok = (len(reasons) == 0)
+    return ok, reasons
+
+# =========================
+# 5) تحليل سهم واحد
+# =========================
+def analyze_one(ticker: str):
+    t = (ticker or "").strip().upper()
+    if not t:
+        return {"error": "Ticker is required."}
     if not t.endswith(".SR"):
         t += ".SR"
-    return t
 
-def rule_fallback(feat_df: pd.DataFrame):
-    entry = float(feat_df["close"].iloc[-1])
-    r = float(feat_df["rsi14"].iloc[-1])
-    mh = float(feat_df["macd_hist"].iloc[-1])
-    ema20_v = float(feat_df["ema20"].iloc[-1])
-    buy = (r < 70) and (mh > 0) and (entry > ema20_v)
-    prob = 0.55 if buy else 0.45
-    return buy, prob
-
-def analyze_one(ticker: str):
-    t = normalize_ticker(ticker)
-
-    df = fetch_yahoo_prices(t, range_="1y", interval="1d", min_rows=80)
+    df = fetch_yahoo_prices(t, range_="1y", interval="1d")
     if df is None:
-        return {"ticker": t, "recommendation": "NO_TRADE", "confidence": 0.0, "reason": "No price data returned from provider."}
+        return {
+            "ticker": t,
+            "recommendation": "NO_TRADE",
+            "confidence": 0.0,
+            "reason": "No price data returned from provider."
+        }
 
     feat_df = build_features(df)
-    if len(feat_df) < 30:
-        return {"ticker": t, "recommendation": "NO_TRADE", "confidence": 0.0, "reason": "Not enough data after feature engineering."}
+    if len(feat_df) < 10:
+        return {
+            "ticker": t,
+            "recommendation": "NO_TRADE",
+            "confidence": 0.0,
+            "reason": "Not enough data after feature engineering."
+        }
 
     last_close = float(feat_df["close"].iloc[-1])
     entry = last_close
-    take_profit = entry * 1.05
-    stop_loss = entry * 0.98
+    take_profit = entry * (1.0 + TP_PCT)
+    stop_loss = entry * (1.0 - SL_PCT)
 
-    threshold = float(meta.get("threshold", 0.60))
+    # 1) تطبيق القواعد الجديدة أولاً
+    ok, reasons = passes_rules(df, feat_df)
 
-    if model is None:
-        buy, prob = rule_fallback(feat_df)
+    # 2) فحص المخاطرة للوقف الثابت (-2%)
+    if ok and (not risk_check_stop(df, entry, stop_loss)):
+        ok = False
+        reasons.append("Rejected: -2% stop is too tight vs recent lows.")
+
+    # 3) قرار ML (إن وجد) لكنه لا يلغي القواعد
+    conf = 0.0
+    if model is not None:
+        try:
+            X, _ = latest_feature_vector(feat_df)
+            conf = float(model.predict_proba(X)[0, 1])  # احتمال BUY
+        except Exception:
+            conf = 0.0
+
+        # حتى لو conf عالي، لازم القواعد ok
+        recommendation = "BUY" if (ok and conf >= 0.60) else "NO_TRADE"
+
+        if recommendation == "NO_TRADE":
+            if not ok and reasons:
+                reason = " | ".join(reasons[:3])  # نختصر
+            else:
+                reason = "Probability below threshold"
+        else:
+            reason = "Rules+Model confirmed entry."
+
         return {
             "ticker": t,
-            "recommendation": "BUY" if buy else "NO_TRADE",
-            "confidence": round(float(prob), 4),
+            "recommendation": recommendation,
+            "confidence": round(conf, 4),
             "entry": round(entry, 4),
             "take_profit": round(take_profit, 4),
             "stop_loss": round(stop_loss, 4),
-            "reason": "Fallback rule-based (model not loaded).",
+            "reason": reason,
             "last_close": round(last_close, 4),
         }
 
-    X = latest_feature_vector(feat_df)
-    prob = float(model.predict_proba(X)[0, 1])
-    rec = "BUY" if prob >= threshold else "NO_TRADE"
-    reason = "" if rec == "BUY" else f"Probability below threshold ({threshold})"
+    # 4) Rule-based فقط (بدون ML)
+    # نعطي ثقة بسيطة بناء على قوة الإشارة (نقاط)
+    if ok:
+        # نبني ثقة تقريبية (ليست ضمان)
+        last = feat_df.iloc[-1]
+        score = 0
+        score += 1 if float(last["close"]) >= float(last["ema20"]) else 0
+        score += 1 if float(last["ema20"]) >= float(last["ema50"]) else 0
+        score += 1 if (RSI_MIN <= float(last["rsi14"]) <= RSI_MAX) else 0
+        score += 1 if float(last["macd_hist"]) >= 0 else 0
+        score += 1 if is_consolidating(feat_df, CONSOL_DAYS) else 0
+        conf = min(0.50 + 0.08 * score, 0.85)
+        recommendation = "BUY"
+        reason = "Rules confirmed: safe entry zone."
+    else:
+        recommendation = "NO_TRADE"
+        conf = 0.35
+        reason = " | ".join(reasons[:3]) if reasons else "Rules rejected."
 
     return {
         "ticker": t,
-        "recommendation": rec,
-        "confidence": round(prob, 4),
+        "recommendation": recommendation,
+        "confidence": round(conf, 4),
         "entry": round(entry, 4),
         "take_profit": round(take_profit, 4),
         "stop_loss": round(stop_loss, 4),
@@ -259,6 +453,46 @@ def analyze_one(ticker: str):
         "last_close": round(last_close, 4),
     }
 
+# =========================
+# 6) Endpoints
+# =========================
+@app.get("/health")
+def health():
+    return {
+        "status": "OK",
+        "model_loaded": bool(model),
+        "rules_version": "v1.0",
+        "tp_pct": TP_PCT,
+        "sl_pct": SL_PCT,
+        "tickers_file": TICKERS_PATH,
+    }
+
+@app.get("/predict")
+def predict(ticker: str):
+    return analyze_one(ticker)
+
+@app.get("/debug_prices")
+def debug_prices(ticker: str):
+    t = ticker.strip().upper()
+    if not t.endswith(".SR"):
+        t += ".SR"
+    df = fetch_yahoo_prices(t, range_="1y", interval="1d")
+    if df is None:
+        return {"ticker": t, "ok": False, "rows": 0}
+    return {"ticker": t, "ok": True, "rows": int(len(df)), "last_close": float(df["close"].iloc[-1])}
+
+@app.get("/check_tickers")
+def check_tickers():
+    # يساعدنا نتأكد الملف موجود داخل السيرفر
+    path = os.path.abspath(TICKERS_PATH)
+    if not os.path.exists(TICKERS_PATH):
+        return {"exists": False, "path": path, "count": 0, "sample": []}
+    tickers = load_tickers_from_file(TICKERS_PATH)
+    return {"exists": True, "path": path, "count": len(tickers), "sample": tickers[:10]}
+
+# =========================
+# 7) Top10 (تاسي فقط عبر tickers_sa.txt)
+# =========================
 def load_tickers_from_file(path: str):
     if not os.path.exists(path):
         return []
@@ -271,42 +505,24 @@ def load_tickers_from_file(path: str):
             if not t.endswith(".SR"):
                 t += ".SR"
             items.append(t)
-    seen=set()
-    out=[]
+
+    # إزالة التكرار مع الحفاظ على الترتيب
+    seen = set()
+    out = []
     for x in items:
         if x not in seen:
             seen.add(x)
             out.append(x)
     return out
 
-# ----------------------------
-# Endpoints
-# ----------------------------
-@app.get("/health")
-def health():
-    return {"status": "OK", "model_loaded": bool(model), "version": "v1-ai", "threshold": meta.get("threshold", 0.60)}
-
-@app.get("/model_info")
-def model_info():
-    return {"model_loaded": bool(model), "feature_cols": feature_cols or DEFAULT_FEATURE_COLS, "meta": meta}
-
-@app.get("/tickers_status")
-def tickers_status():
-    exists = os.path.exists(TICKERS_PATH)
-    count = 0
-    sample = []
-    if exists:
-        tickers = load_tickers_from_file(TICKERS_PATH)
-        count = len(tickers)
-        sample = tickers[:10]
-    return {"exists": exists, "path": os.path.abspath(TICKERS_PATH), "count": count, "sample": sample}
-
-@app.get("/predict")
-def predict(ticker: str):
-    return analyze_one(ticker)
-
 @app.get("/top10")
-def top10(max_workers: int = 10):
+def top10(max_workers: int = 8):
+    """
+    يقرأ tickers_sa.txt (تاسي فقط) ويحلل كل الأسهم
+    ويرجع أفضل 10 حسب:
+      - BUY أولاً
+      - ثم confidence أعلى
+    """
     tickers = load_tickers_from_file(TICKERS_PATH)
     if not tickers:
         return {"items": [], "error": f"Tickers file not found or empty: {TICKERS_PATH}"}
@@ -322,17 +538,18 @@ def top10(max_workers: int = 10):
             except Exception:
                 errors += 1
 
-    # BUY first then confidence desc
     def score(item):
         rec = item.get("recommendation", "NO_TRADE")
         conf = float(item.get("confidence", 0.0) or 0.0)
         return (1 if rec == "BUY" else 0, conf)
 
     results_sorted = sorted(results, key=score, reverse=True)
+    top_items = results_sorted[:10]
+
     return {
-        "items": results_sorted[:10],
+        "items": top_items,
         "total": len(results),
         "errors": errors,
-        "source": "tickers_sa.txt",
-        "note": "Sorted by (BUY first) then confidence desc"
+        "source": TICKERS_PATH,
+        "note": "Rules v1.0: filters spikes/overextension + RSI band + base/consolidation + risk check"
     }
