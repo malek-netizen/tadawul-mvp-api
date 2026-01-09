@@ -11,10 +11,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # =========================
 # Tadawul MVP API (Rules v1.2)
 # هدف: +5% | وقف: -2% | تاسي فقط
-# ML ALWAYS computed -> ml_confidence is NEVER null if model loaded
+# ML ALWAYS computed -> ml_confidence is NEVER null if model loaded (unless predict fails)
 # =========================
 
-app = FastAPI(title="Tadawul MVP API", version="2.2.0-rules-v1.2")
+app = FastAPI(title="Tadawul MVP API", version="2.2.1-rules-v1.2-top10cache")
 
 app.add_middleware(
     CORSMiddleware,
@@ -51,10 +51,10 @@ TOP10_WORKERS = 6    # لتقليل تعليق top10 على Render
 model = None
 
 # =========================
-# Cache بسيط لتقليل ضغط Yahoo أثناء /top10
+# Cache للأسعار لتقليل ضغط Yahoo (مهم لـ /top10)
 # =========================
 _prices_cache = {}  # key: (ticker, range_, interval) -> {"ts": ..., "df": ...}
-CACHE_TTL_SEC = 60  # دقيقة واحدة
+CACHE_TTL_SEC = 600  # 10 دقائق
 
 def _cache_get(key):
     v = _prices_cache.get(key)
@@ -67,6 +67,12 @@ def _cache_get(key):
 
 def _cache_set(key, df):
     _prices_cache[key] = {"ts": time.time(), "df": df}
+
+# =========================
+# Cache خاص بنتيجة /top10 لمنع التعليق
+# =========================
+_top10_cache = {"ts": 0, "data": None}
+TOP10_CACHE_TTL_SEC = 600  # 10 دقائق
 
 # =========================
 # 1) جلب الأسعار من Yahoo Chart
@@ -127,6 +133,7 @@ def fetch_yahoo_prices(ticker: str, range_: str = "1y", interval: str = "1d", mi
                 )
 
                 df = df.dropna(subset=["close"]).reset_index(drop=True)
+
                 if len(df) >= min_rows:
                     _cache_set(key, df)
                     return df
@@ -296,19 +303,14 @@ def broke_recent_low(df_ohlc: pd.DataFrame, lookback: int = LOOKBACK_LOW_DAYS) -
 def spike_without_base(feat_df: pd.DataFrame) -> bool:
     last = feat_df.iloc[-1]
     ret1 = float(last["ret1"])
-    if ret1 >= SPIKE_RET1 and (not is_consolidating(feat_df, CONSOL_DAYS)):
-        return True
-    return False
+    return ret1 >= SPIKE_RET1 and (not is_consolidating(feat_df, CONSOL_DAYS))
 
 def risk_check_stop(df_ohlc: pd.DataFrame, stop: float) -> bool:
     if len(df_ohlc) < 10:
         return False
     recent = df_ohlc.tail(5)
     recent_low = float(recent["low"].min())
-    # إذا قاع آخر 5 أيام أقل من وقفنا -> احتمال ضرب الوقف عالي
-    if recent_low < stop:
-        return False
-    return True
+    return not (recent_low < stop)
 
 def passes_rules(df_ohlc: pd.DataFrame, feat_df: pd.DataFrame):
     reasons = []
@@ -319,7 +321,6 @@ def passes_rules(df_ohlc: pd.DataFrame, feat_df: pd.DataFrame):
     ema50 = float(last["ema50"])
     rsi14 = float(last["rsi14"])
 
-    # 1) منع سياق هابط قوي
     if broke_recent_low(df_ohlc, LOOKBACK_LOW_DAYS):
         reasons.append("Rejected: recent low broken (bearish context).")
 
@@ -327,67 +328,50 @@ def passes_rules(df_ohlc: pd.DataFrame, feat_df: pd.DataFrame):
     if ts < MIN_TREND_SCORE:
         reasons.append("Rejected: weak trend context (down/weak structure).")
 
-    # 2) منع الاندفاع
     if spike_without_base(feat_df):
         reasons.append("Rejected: strong 1-day spike without consolidation (chasing).")
 
-    # 3) RSI
     if rsi14 > RSI_OVERBOUGHT:
         reasons.append("Rejected: RSI overbought (>70).")
 
     if not (RSI_MIN <= rsi14 <= RSI_MAX):
-        # استثناء: RSI بين 35-40 + تماسك
         if not (rsi14 >= 35 and is_consolidating(feat_df, CONSOL_DAYS)):
             reasons.append("Rejected: RSI not in safe band (40-65) and no consolidation exception.")
 
-    # 4) مبالغة فوق المتوسطات
     if ema20 > 0 and (close - ema20) / ema20 > MAX_ABOVE_EMA20:
         reasons.append("Rejected: price too far above EMA20 (overextended).")
     if ema50 > 0 and (close - ema50) / ema50 > MAX_ABOVE_EMA50:
         reasons.append("Rejected: price too far above EMA50 (overextended).")
 
-    # 5) MACD تحسن بسيط
     if len(feat_df) >= 4:
         h = feat_df["macd_hist"].tail(4).values
         if not (h[-1] >= h[-2] or h[-1] >= 0):
             reasons.append("Rejected: MACD histogram not improving.")
 
-    # 6) قاعدة base/تماسك لتقليل الإشارات
     base_ok = is_consolidating(feat_df, CONSOL_DAYS)
     if not base_ok and ts < 3:
         reasons.append("Rejected: no clear consolidation/base before entry.")
 
-    ok = (len(reasons) == 0)
-    return ok, reasons
+    return (len(reasons) == 0), reasons
 
 def rules_score(feat_df: pd.DataFrame) -> int:
-    """
-    score من 0 إلى 100 تقريبًا (ليس ضمان).
-    نستخدمه كـ confidence_pct إذا ML غير متاح.
-    """
     if len(feat_df) < 5:
         return 30
     last = feat_df.iloc[-1]
     score = 0
 
-    # trend
     score += 15 if float(last["close"]) >= float(last["ema20"]) else 0
     score += 15 if float(last["ema20"]) >= float(last["ema50"]) else 0
 
-    # RSI
     r = float(last["rsi14"])
     if RSI_MIN <= r <= RSI_MAX:
         score += 20
     elif 35 <= r < RSI_MIN:
         score += 10
 
-    # MACD hist
     score += 15 if float(last["macd_hist"]) >= 0 else 5
-
-    # base
     score += 20 if is_consolidating(feat_df, CONSOL_DAYS) else 5
 
-    # overextension penalty
     close = float(last["close"])
     ema20 = float(last["ema20"])
     if ema20 > 0 and (close - ema20) / ema20 > MAX_ABOVE_EMA20:
@@ -443,7 +427,6 @@ def analyze_one(ticker: str):
     take_profit = entry * (1.0 + TP_PCT)
     stop_loss = entry * (1.0 - SL_PCT)
 
-    # RULES
     ok, reasons = passes_rules(df, feat_df)
     if ok and (not risk_check_stop(df, stop_loss)):
         ok = False
@@ -451,7 +434,6 @@ def analyze_one(ticker: str):
 
     r_score = rules_score(feat_df)
 
-    # ML ALWAYS attempt if model exists
     ml_conf = None
     if model is not None:
         try:
@@ -460,22 +442,18 @@ def analyze_one(ticker: str):
         except Exception:
             ml_conf = None
 
-    # Decide final
     if not ok:
         recommendation = "NO_TRADE"
         status = "REJECTED"
-        # confidence_pct: نعطي قواعد فقط (أو ML لو موجود لكن ما يغيّر الرفض)
         conf_pct = int(round(r_score))
         reason = " | ".join(reasons[:3]) if reasons else "Rejected by rules."
     else:
-        # rules OK => now ML (if available) decides BUY/NO_TRADE
         if ml_conf is not None:
             recommendation = "BUY" if ml_conf >= ML_THRESHOLD else "NO_TRADE"
             status = "APPROVED" if recommendation == "BUY" else "APPROVED_BUT_LOW_ML"
             conf_pct = int(round(ml_conf * 100))
             reason = "Rules+ML confirmed entry." if recommendation == "BUY" else "Rules OK but ML below threshold."
         else:
-            # no model -> rules-based only
             recommendation = "BUY" if r_score >= 70 else "NO_TRADE"
             status = "APPROVED_RULES_ONLY" if recommendation == "BUY" else "APPROVED_BUT_LOW_SCORE"
             conf_pct = int(round(r_score))
@@ -485,9 +463,9 @@ def analyze_one(ticker: str):
         "ticker": t,
         "recommendation": recommendation,
         "status": status,
-        "confidence_pct": conf_pct,          # هذا اللي تعرضه في الواجهة %
-        "ml_confidence": ml_conf,            # رقم بين 0 و1 أو null إذا ML فشل
-        "rules_score": int(r_score),          # 0..100
+        "confidence_pct": conf_pct,
+        "ml_confidence": ml_conf,
+        "rules_score": int(r_score),
         "entry": round(entry, 4),
         "take_profit": round(take_profit, 4),
         "stop_loss": round(stop_loss, 4),
@@ -511,7 +489,6 @@ def load_tickers_from_file(path: str):
                 s += ".SR"
             items.append(s)
 
-    # إزالة التكرار
     seen = set()
     out = []
     for x in items:
@@ -533,7 +510,9 @@ def health():
         "sl_pct": SL_PCT,
         "tickers_file": TICKERS_PATH,
         "ml_threshold": ML_THRESHOLD,
-        "top10_mode": "ranking+decision",
+        "top10_workers": TOP10_WORKERS,
+        "prices_cache_ttl_sec": CACHE_TTL_SEC,
+        "top10_cache_ttl_sec": TOP10_CACHE_TTL_SEC,
     }
 
 @app.get("/predict")
@@ -570,9 +549,17 @@ def top10(max_workers: int = TOP10_WORKERS):
       2) confidence_pct أعلى
       3) ml_confidence أعلى (إن وجد)
     """
+
+    now = time.time()
+    if _top10_cache["data"] is not None and (now - _top10_cache["ts"] < TOP10_CACHE_TTL_SEC):
+        cached_payload = dict(_top10_cache["data"])
+        cached_payload["cached"] = True
+        cached_payload["cached_age_sec"] = int(now - _top10_cache["ts"])
+        return cached_payload
+
     tickers = load_tickers_from_file(TICKERS_PATH)
     if not tickers:
-        return {"items": [], "error": f"Tickers file not found or empty: {TICKERS_PATH}"}
+        return {"items": [], "error": f"Tickers file not found or empty: {TICKERS_PATH}", "cached": False}
 
     results = []
     errors = 0
@@ -595,10 +582,17 @@ def top10(max_workers: int = TOP10_WORKERS):
     results_sorted = sorted(results, key=score, reverse=True)
     top_items = results_sorted[:10]
 
-    return {
+    payload = {
         "items": top_items,
         "total": len(results),
         "errors": errors,
         "source": TICKERS_PATH,
-        "note": "Rules v1.2 + ML always computed (if model loaded)."
+        "note": "Rules v1.2 + ML computed if model loaded. Top10 cached for 10 minutes.",
+        "cached": False,
+        "computed_at_unix": int(time.time()),
     }
+
+    _top10_cache["ts"] = time.time()
+    _top10_cache["data"] = payload
+
+    return payload
