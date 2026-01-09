@@ -2,21 +2,27 @@ import os
 import time
 import joblib
 import requests
-import numpy as np
 import pandas as pd
+import numpy as np
 
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score
+from sklearn.ensemble import RandomForestClassifier
 
 MODEL_PATH = "model.joblib"
 TICKERS_PATH = "tickers_sa.txt"
 
-# ----------------------------
-# Yahoo fetch (Chart API)
-# ----------------------------
-def fetch_yahoo_prices(ticker: str, range_: str = "5y", interval: str = "1d", min_rows: int = 220):
+TP_PCT = 0.05
+SL_PCT = 0.02
+
+MIN_ROWS = 120          # نحتاج تاريخ كافي
+MIN_TRAIN_SAMPLES = 500 # حد أدنى للبيانات قبل التدريب
+MAX_TICKERS = None      # None = كل القائمة، أو حط رقم للتجربة مثل 50
+
+# --------------------------------
+# Yahoo fetch
+# --------------------------------
+def fetch_yahoo_prices(ticker: str, range_: str = "2y", interval: str = "1d"):
     bases = [
         "https://query1.finance.yahoo.com/v8/finance/chart/",
         "https://query2.finance.yahoo.com/v8/finance/chart/",
@@ -27,16 +33,11 @@ def fetch_yahoo_prices(ticker: str, range_: str = "5y", interval: str = "1d", mi
         "Accept-Language": "en-US,en;q=0.9",
     }
 
-    for attempt in range(3):
+    for _ in range(3):
         for base in bases:
             try:
                 url = f"{base}{ticker}"
-                r = requests.get(
-                    url,
-                    params={"range": range_, "interval": interval},
-                    headers=headers,
-                    timeout=25,
-                )
+                r = requests.get(url, params={"range": range_, "interval": interval}, headers=headers, timeout=25)
                 if r.status_code != 200:
                     continue
 
@@ -53,156 +54,161 @@ def fetch_yahoo_prices(ticker: str, range_: str = "5y", interval: str = "1d", mi
                 if not quote:
                     continue
 
-                df = pd.DataFrame(
-                    {
-                        "open": quote.get("open", []),
-                        "high": quote.get("high", []),
-                        "low": quote.get("low", []),
-                        "close": quote.get("close", []),
-                        "volume": quote.get("volume", []),
-                    }
-                ).dropna(subset=["close"]).reset_index(drop=True)
-
-                if len(df) >= min_rows:
-                    return df
-
+                df = pd.DataFrame({
+                    "open": quote.get("open", []),
+                    "high": quote.get("high", []),
+                    "low": quote.get("low", []),
+                    "close": quote.get("close", []),
+                    "volume": quote.get("volume", []),
+                })
+                df = df.dropna(subset=["close"]).reset_index(drop=True)
+                return df if len(df) > 0 else None
             except Exception:
                 continue
-
         time.sleep(1)
-
     return None
 
-# ----------------------------
-# Indicators
-# ----------------------------
-def sma(s, w): return s.rolling(w).mean()
-def ema(s, span): return s.ewm(span=span, adjust=False).mean()
+# --------------------------------
+# Indicators (نفس API)
+# --------------------------------
+def sma(series, window):
+    return series.rolling(window).mean()
+
+def ema(series, span):
+    return series.ewm(span=span, adjust=False).mean()
 
 def rsi(close, period=14):
-    d = close.diff()
-    gain = d.where(d > 0, 0.0)
-    loss = (-d).where(d < 0, 0.0)
-    avg_g = gain.rolling(period).mean()
-    avg_l = loss.rolling(period).mean()
-    rs = avg_g / (avg_l + 1e-9)
+    delta = close.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = (-delta).where(delta < 0, 0.0)
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+    rs = avg_gain / (avg_loss + 1e-9)
     return 100 - (100 / (1 + rs))
 
 def macd(close, fast=12, slow=26, signal=9):
-    f = ema(close, fast)
-    s = ema(close, slow)
-    m = f - s
-    sig = ema(m, signal)
-    hist = m - sig
-    return m, sig, hist
+    ema_fast = ema(close, fast)
+    ema_slow = ema(close, slow)
+    macd_line = ema_fast - ema_slow
+    signal_line = ema(macd_line, signal)
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
 
-def bollinger(close, w=20, n=2):
-    mid = sma(close, w)
-    std = close.rolling(w).std()
-    up = mid + n * std
-    lo = mid - n * std
-    return up, mid, lo
+def bollinger(close, window=20, num_std=2):
+    mid = sma(close, window)
+    std = close.rolling(window).std()
+    upper = mid + num_std * std
+    lower = mid - num_std * std
+    return upper, mid, lower
 
 def atr(high, low, close, period=14):
-    prev = close.shift(1)
+    prev_close = close.shift(1)
     tr = pd.concat(
-        [(high - low), (high - prev).abs(), (low - prev).abs()],
-        axis=1
+        [(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
     ).max(axis=1)
     return tr.rolling(period).mean()
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
-    c = d["close"]
-    h = d["high"]
-    l = d["low"]
-    v = d["volume"].fillna(0)
+    close = d["close"]
+    high = d["high"]
+    low = d["low"]
+    vol = d["volume"].fillna(0)
 
-    d["sma10"] = sma(c, 10)
-    d["sma20"] = sma(c, 20)
-    d["sma50"] = sma(c, 50)
+    d["sma10"] = sma(close, 10)
+    d["sma20"] = sma(close, 20)
+    d["sma50"] = sma(close, 50)
 
-    d["ema10"] = ema(c, 10)
-    d["ema20"] = ema(c, 20)
-    d["ema50"] = ema(c, 50)
+    d["ema10"] = ema(close, 10)
+    d["ema20"] = ema(close, 20)
+    d["ema50"] = ema(close, 50)
 
-    d["rsi14"] = rsi(c, 14)
+    d["rsi14"] = rsi(close, 14)
 
-    m, sig, hist = macd(c)
-    d["macd"] = m
-    d["macd_signal"] = sig
+    macd_line, signal_line, hist = macd(close, 12, 26, 9)
+    d["macd"] = macd_line
+    d["macd_signal"] = signal_line
     d["macd_hist"] = hist
 
-    up, mid, lo = bollinger(c, 20, 2)
-    d["bb_upper"] = up
-    d["bb_mid"] = mid
-    d["bb_lower"] = lo
-    d["bb_width"] = (up - lo) / (mid + 1e-9)
+    bb_u, bb_m, bb_l = bollinger(close, 20, 2)
+    d["bb_upper"] = bb_u
+    d["bb_mid"] = bb_m
+    d["bb_lower"] = bb_l
+    d["bb_width"] = (bb_u - bb_l) / (bb_m + 1e-9)
 
-    d["atr14"] = atr(h, l, c, 14)
+    d["atr14"] = atr(high, low, close, 14)
 
-    d["ret1"] = c.pct_change(1)
-    d["ret5"] = c.pct_change(5)
+    d["ret1"] = close.pct_change(1)
+    d["ret3"] = close.pct_change(3)
+    d["ret5"] = close.pct_change(5)
     d["vol20"] = d["ret1"].rolling(20).std()
 
-    d["vol_ma20"] = v.rolling(20).mean()
-    d["vol_ratio"] = v / (d["vol_ma20"] + 1e-9)
+    d["vol_ma20"] = vol.rolling(20).mean()
+    d["vol_ratio"] = vol / (d["vol_ma20"] + 1e-9)
 
-    return d.dropna().reset_index(drop=True)
+    d = d.dropna().reset_index(drop=True)
+    return d
 
 FEATURE_COLS = [
-    "sma10","sma20","sma50",
-    "ema10","ema20","ema50",
+    "sma10", "sma20", "sma50",
+    "ema10", "ema20", "ema50",
     "rsi14",
-    "macd","macd_signal","macd_hist",
+    "macd", "macd_signal", "macd_hist",
     "bb_width",
     "atr14",
-    "ret1","ret5","vol20",
+    "ret1", "ret3", "ret5", "vol20",
     "vol_ratio",
 ]
 
-# ----------------------------
-# Label: TP before SL within horizon
-# TP = +5%, SL = -2%, horizon=30
-# using daily HIGH/LOW (realistic)
-# ----------------------------
-def make_label(df_feat: pd.DataFrame, horizon=30, tp=0.05, sl=0.02):
-    closes = df_feat["close"].values
-    highs = df_feat["high"].values
-    lows  = df_feat["low"].values
+# --------------------------------
+# Labeling: تحقق +5% قبل -2% (بدون مدة قصوى، حتى نهاية البيانات)
+# عملياً: نبحث للأمام حتى النهاية المتاحة
+# --------------------------------
+def make_labels(df_ohlc: pd.DataFrame, feat_df: pd.DataFrame, tp_pct=TP_PCT, sl_pct=SL_PCT):
+    """
+    لكل يوم i (بعد اكتمال المؤشرات):
+      entry = close[i]
+      tp = entry*(1+tp_pct)
+      sl = entry*(1-sl_pct)
+      نبحث في الأيام القادمة:
+        إذا high >= tp قبل low <= sl => label=1
+        إذا low <= sl قبل high >= tp => label=0
+        إذا لم يتحقق شيء حتى نهاية البيانات => نتركه NaN (نستبعده)
+    """
+    # لازم نفس الطول/الفهرس
+    # feat_df ناتج من df_ohlc بعد dropna، فنعتمد على feat_df index كترتيب زمني
+    highs = feat_df["high"].values
+    lows = feat_df["low"].values
+    closes = feat_df["close"].values
 
-    y = np.zeros(len(df_feat), dtype=int)
+    labels = np.full(len(feat_df), np.nan, dtype=float)
 
-    for i in range(len(df_feat) - horizon):
-        entry = closes[i]
-        tp_level = entry * (1 + tp)
-        sl_level = entry * (1 - sl)
+    for i in range(len(feat_df) - 2):
+        entry = float(closes[i])
+        tp = entry * (1.0 + tp_pct)
+        sl = entry * (1.0 - sl_pct)
 
-        hit_tp = None
-        hit_sl = None
-
-        for j in range(1, horizon+1):
-            if highs[i+j] >= tp_level:
-                hit_tp = j
+        hit = None
+        for j in range(i + 1, len(feat_df)):
+            # أول حدث زمني
+            if lows[j] <= sl:
+                hit = 0
+                break
+            if highs[j] >= tp:
+                hit = 1
                 break
 
-        for j in range(1, horizon+1):
-            if lows[i+j] <= sl_level:
-                hit_sl = j
-                break
+        labels[i] = hit if hit is not None else np.nan
 
-        # success if TP happens and either SL never happens OR TP earlier than SL
-        if hit_tp is not None and (hit_sl is None or hit_tp < hit_sl):
-            y[i] = 1
-        else:
-            y[i] = 0
+    return labels
 
-    # last horizon rows have no future window -> drop later
-    return y
-
+# --------------------------------
+# tickers loader
+# --------------------------------
 def load_tickers(path: str):
     if not os.path.exists(path):
-        raise FileNotFoundError(f"Missing {path}")
+        return []
     out = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -213,89 +219,88 @@ def load_tickers(path: str):
                 t += ".SR"
             out.append(t)
     # unique keep order
-    seen=set()
-    uniq=[]
-    for t in out:
-        if t not in seen:
-            seen.add(t)
-            uniq.append(t)
+    seen = set()
+    uniq = []
+    for x in out:
+        if x not in seen:
+            seen.add(x)
+            uniq.append(x)
     return uniq
 
 def main():
     tickers = load_tickers(TICKERS_PATH)
-    print("Tickers:", len(tickers))
+    if MAX_TICKERS is not None:
+        tickers = tickers[:MAX_TICKERS]
 
-    X_all = []
-    y_all = []
+    if not tickers:
+        raise RuntimeError(f"tickers file missing/empty: {TICKERS_PATH}")
 
-    for k, t in enumerate(tickers, 1):
-        df = fetch_yahoo_prices(t, range_="5y", interval="1d", min_rows=260)
-        if df is None:
-            print("skip (no data):", t)
+    rows = []
+    used = 0
+
+    for t in tickers:
+        df = fetch_yahoo_prices(t, range_="2y", interval="1d")
+        if df is None or len(df) < MIN_ROWS:
             continue
 
         feat = build_features(df)
-        if len(feat) < 260:
-            print("skip (short feat):", t, len(feat))
+        if len(feat) < 100:
             continue
 
-        y = make_label(feat, horizon=30, tp=0.05, sl=0.02)
+        y = make_labels(df, feat, TP_PCT, SL_PCT)
 
-        # remove last 30 rows (no label)
-        feat2 = feat.iloc[:-30].copy()
-        y2 = y[:-30]
+        # نبني dataset
+        X = feat[FEATURE_COLS].copy()
+        X["label"] = y
+        X = X.dropna(subset=["label"]).reset_index(drop=True)
 
-        X_all.append(feat2[FEATURE_COLS].values)
-        y_all.append(y2)
+        if len(X) < 30:
+            continue
 
-        if k % 20 == 0:
-            print(f"processed {k}/{len(tickers)}")
+        X["ticker"] = t
+        rows.append(X)
+        used += 1
+        print(f"[OK] {t} samples={len(X)}")
 
-    if not X_all:
-        raise RuntimeError("No training data built. Check tickers and Yahoo access.")
+        # نوم بسيط لتخفيف ضغط Yahoo
+        time.sleep(0.2)
 
-    X = np.vstack(X_all)
-    y = np.concatenate(y_all)
+    if not rows:
+        raise RuntimeError("No training data collected.")
 
-    print("Dataset shape:", X.shape, "Pos rate:", y.mean().round(4))
+    data = pd.concat(rows, ignore_index=True)
+    print("Tickers used:", used)
+    print("Total samples:", len(data))
 
-    # time-safe split (simple): last 20% as test
-    n = len(X)
-    split = int(n * 0.8)
+    if len(data) < MIN_TRAIN_SAMPLES:
+        raise RuntimeError(f"Not enough samples for training. Need >= {MIN_TRAIN_SAMPLES}, got {len(data)}")
 
-    X_train, X_test = X[:split], X[split:]
-    y_train, y_test = y[:split], y[split:]
+    y = data["label"].astype(int).values
+    X = data[FEATURE_COLS].astype(float).values
 
-    clf = Pipeline([
-        ("scaler", StandardScaler()),
-        ("lr", LogisticRegression(
-            max_iter=4000,
-            class_weight="balanced",
-            solver="lbfgs"
-        ))
-    ])
+    # تقسيم زمني بسيط (بدون خلط شديد)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=42, stratify=y
+    )
 
+    # موديل بسيط قوي (احتمالات)
+    clf = RandomForestClassifier(
+        n_estimators=400,
+        max_depth=8,
+        min_samples_leaf=20,
+        random_state=42,
+        n_jobs=-1,
+        class_weight="balanced",
+    )
     clf.fit(X_train, y_train)
 
-    p = clf.predict_proba(X_test)[:, 1]
-    auc = roc_auc_score(y_test, p) if len(np.unique(y_test)) > 1 else float("nan")
+    # تقييم سريع
+    proba = clf.predict_proba(X_test)[:, 1]
+    auc = roc_auc_score(y_test, proba)
     print("AUC:", auc)
 
-    payload = {
-        "pipeline": clf,
-        "feature_cols": FEATURE_COLS,
-        "meta": {
-            "tp": 0.05,
-            "sl": 0.02,
-            "horizon": 30,
-            "threshold": 0.55,   # نخففها شوي ليظهر BUY منطقي
-            "auc": float(auc) if auc == auc else None,
-            "built_from": len(tickers)
-        }
-    }
-
-    joblib.dump(payload, MODEL_PATH)
-    print("Saved", MODEL_PATH)
+    joblib.dump(clf, MODEL_PATH)
+    print("Saved:", MODEL_PATH)
 
 if __name__ == "__main__":
     main()
