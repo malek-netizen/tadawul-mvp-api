@@ -1,7 +1,3 @@
-# ===============================
-# Tadawul MVP API + إعادة تدريب ML
-# ===============================
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
@@ -11,52 +7,34 @@ import joblib
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
 
-# ===============================
-# إعداد FastAPI
-# ===============================
+# ------------------------
+MODEL_PATH = "model.joblib"
+TICKERS_PATH = "tickers_sa.txt"
+ML_THRESHOLD = 0.60
+TOP10_WORKERS = 6
+FEATURE_COLS = [
+    "sma10","sma20","sma50",
+    "ema10","ema20","ema50",
+    "rsi14","macd","macd_signal","macd_hist",
+    "bb_width","atr14","ret1","ret3","ret5","vol20","vol_ratio"
+]
+
+# ------------------------
 app = FastAPI(title="Tadawul MVP API", version="2.3.0-with-ML")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"]
 )
 
-MODEL_PATH = "model.joblib"
-TICKERS_PATH = "tickers_sa.txt"
-
-TP_PCT = 0.05
-SL_PCT = 0.02
-
-RSI_MIN = 40
-RSI_MAX = 65
-RSI_OVERBOUGHT = 70
-MAX_ABOVE_EMA20 = 0.06
-MAX_ABOVE_EMA50 = 0.08
-CONSOL_DAYS = 4
-LOOKBACK_LOW_DAYS = 10
-MIN_TREND_SCORE = 2
-ML_THRESHOLD = 0.60
-TOP10_WORKERS = 6
-
-FEATURE_COLS = ["sma10","sma20","sma50","ema10","ema20","ema50",
-                "rsi14","macd","macd_signal","macd_hist","bb_width",
-                "atr14","ret1","ret3","ret5","vol20","vol_ratio"]
-
 model = None
-
-# ===============================
-# Cache الأسعار
-# ===============================
 _prices_cache = {}
 CACHE_TTL_SEC = 600
 _top10_cache = {"ts":0,"data":None}
-TOP10_CACHE_TTL_SEC = 600
 
+# ------------------------
 def _cache_get(key):
     v = _prices_cache.get(key)
     if not v: return None
@@ -68,10 +46,8 @@ def _cache_get(key):
 def _cache_set(key, df):
     _prices_cache[key] = {"ts": time.time(), "df": df}
 
-# ===============================
-# 1) جلب الأسعار من Yahoo
-# ===============================
-def fetch_yahoo_prices(ticker: str, range_="1y", interval="1d", min_rows=80):
+# ------------------------
+def fetch_yahoo_prices(ticker: str, range_="2y", interval="1d"):
     key = (ticker, range_, interval)
     cached = _cache_get(key)
     if cached is not None: return cached
@@ -85,10 +61,9 @@ def fetch_yahoo_prices(ticker: str, range_="1y", interval="1d", min_rows=80):
                 r = requests.get(url, params={"range": range_, "interval": interval}, headers=headers, timeout=20)
                 if r.status_code != 200: continue
                 js = r.json()
-                chart = js.get("chart",{})
-                result = (chart.get("result") or [None])[0]
+                result = (js.get("chart", {}).get("result") or [None])[0]
                 if not result: continue
-                quote = (result.get("indicators",{}).get("quote") or [None])[0]
+                quote = (result.get("indicators", {}).get("quote") or [None])[0]
                 if not quote: continue
                 df = pd.DataFrame({
                     "open": quote.get("open",[]),
@@ -97,25 +72,22 @@ def fetch_yahoo_prices(ticker: str, range_="1y", interval="1d", min_rows=80):
                     "close": quote.get("close",[]),
                     "volume": quote.get("volume",[])
                 }).dropna(subset=["close"]).reset_index(drop=True)
-                if len(df) >= min_rows:
+                if len(df) > 0:
                     _cache_set(key, df)
                     return df
-            except Exception: continue
+            except: continue
         time.sleep(1)
     return None
 
-# ===============================
-# 2) المؤشرات الفنية
-# ===============================
+# ------------------------
+# مؤشرات فنية
 def sma(series, window): return series.rolling(window).mean()
 def ema(series, span): return series.ewm(span=span, adjust=False).mean()
 def rsi(close, period=14):
     delta = close.diff()
     gain = delta.where(delta>0,0.0)
     loss = (-delta).where(delta<0,0.0)
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
-    rs = avg_gain/(avg_loss+1e-9)
+    rs = gain.rolling(period).mean() / (loss.rolling(period).mean()+1e-9)
     return 100-(100/(1+rs))
 def macd(close, fast=12, slow=26, signal=9):
     ema_fast = ema(close, fast)
@@ -127,84 +99,59 @@ def macd(close, fast=12, slow=26, signal=9):
 def bollinger(close, window=20, num_std=2):
     mid = sma(close, window)
     std = close.rolling(window).std()
-    upper = mid + num_std*std
-    lower = mid - num_std*std
-    return upper, mid, lower
+    return mid+num_std*std, mid, mid-num_std*std
 def atr(high, low, close, period=14):
-    prev_close = close.shift(1)
-    tr = pd.concat([(high-low), (high-prev_close).abs(), (low-prev_close).abs()], axis=1).max(axis=1)
+    prev = close.shift(1)
+    tr = pd.concat([high-low, (high-prev).abs(), (low-prev).abs()], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
-def build_features(df: pd.DataFrame) -> pd.DataFrame:
+def build_features(df):
     d = df.copy()
-    close = d["close"]; high=d["high"]; low=d["low"]; vol=d["volume"].fillna(0)
+    close=d["close"]; high=d["high"]; low=d["low"]; vol=d["volume"]
     d["sma10"]=sma(close,10); d["sma20"]=sma(close,20); d["sma50"]=sma(close,50)
     d["ema10"]=ema(close,10); d["ema20"]=ema(close,20); d["ema50"]=ema(close,50)
     d["rsi14"]=rsi(close,14)
-    macd_line, signal_line, hist = macd(close)
-    d["macd"]=macd_line; d["macd_signal"]=signal_line; d["macd_hist"]=hist
+    macd_line, sig_line, hist = macd(close)
+    d["macd"]=macd_line; d["macd_signal"]=sig_line; d["macd_hist"]=hist
     bb_u, bb_m, bb_l = bollinger(close)
-    d["bb_upper"]=bb_u; d["bb_mid"]=bb_m; d["bb_lower"]=bb_l; d["bb_width"]=(bb_u-bb_l)/(bb_m+1e-9)
+    d["bb_width"]=(bb_u-bb_l)/(bb_m+1e-9)
     d["atr14"]=atr(high, low, close)
     d["ret1"]=close.pct_change(1); d["ret3"]=close.pct_change(3); d["ret5"]=close.pct_change(5)
-    d["vol20"]=d["ret1"].rolling(20).std(); d["vol_ma20"]=vol.rolling(20).mean(); d["vol_ratio"]=vol/(d["vol_ma20"]+1e-9)
+    d["vol20"]=d["ret1"].rolling(20).std(); d["vol_ma20"]=vol.rolling(20).mean()
+    d["vol_ratio"]=vol/(d["vol_ma20"]+1e-9)
     return d.dropna().reset_index(drop=True)
 
 def latest_feature_vector(feat_df):
     row = feat_df.iloc[-1][FEATURE_COLS].astype(float)
-    X = row.values.reshape(1,-1)
-    return X, row.to_dict()
+    return row.values.reshape(1,-1)
 
-# ===============================
-# 3) تحميل أو إعادة تدريب النموذج
-# ===============================
+# ------------------------
 @app.on_event("startup")
-def load_or_train_model():
+def load_model():
     global model
     if os.path.exists(MODEL_PATH):
         try:
             model = joblib.load(MODEL_PATH)
-            print("Loaded existing model.joblib")
-            return
-        except: model=None
-
-    # --- تدريب نموذج جديد مبسط على بيانات CSV ---
-    if os.path.exists("historical_data.csv"):
-        df = pd.read_csv("historical_data.csv")
-        X = df[FEATURE_COLS]
-        y = df['target']
-        X_train, X_test, y_train, y_test = train_test_split(X,y,test_size=0.2,random_state=42)
-        model = RandomForestClassifier(n_estimators=100, random_state=42)
-        model.fit(X_train, y_train)
-        acc = model.score(X_test, y_test)
-        print("Trained new model, test accuracy:", acc)
-        joblib.dump(model, MODEL_PATH)
-        print("Saved new model.joblib")
+            print("Loaded model.joblib")
+        except:
+            model = None
     else:
-        print("No historical_data.csv found. Model not trained.")
+        print("No model found. Run train_model.py first.")
 
-# ===============================
-# 4) تحليل سهم واحد
-# ===============================
+# ------------------------
 def analyze_one(ticker: str):
     t = ticker.strip().upper()
     if not t.endswith(".SR"): t += ".SR"
     df = fetch_yahoo_prices(t)
-    if df is None: return {"ticker": t,"recommendation":"NO_TRADE","ml_confidence":None,"reason":"No price data"}
+    if df is None or len(df)<10: 
+        return {"ticker": t,"recommendation":"NO_TRADE","ml_confidence":None,"reason":"No price data"}
     feat_df = build_features(df)
-    if len(feat_df)<10: return {"ticker": t,"recommendation":"NO_TRADE","ml_confidence":None,"reason":"Not enough data"}
-
-    ml_conf = None
-    if model is not None:
-        try: X,_ = latest_feature_vector(feat_df); ml_conf=float(model.predict_proba(X)[0,1])
-        except: ml_conf=None
-
+    X = latest_feature_vector(feat_df)
+    ml_conf = float(model.predict_proba(X)[0,1]) if model else None
     recommendation = "BUY" if ml_conf and ml_conf>=ML_THRESHOLD else "NO_TRADE"
     return {"ticker": t, "recommendation": recommendation, "ml_confidence": ml_conf, "last_close": float(feat_df["close"].iloc[-1])}
 
-# ===============================
-# 5) Endpoints
-# ===============================
+# ------------------------
 @app.get("/predict")
 def predict(ticker: str):
     return analyze_one(ticker)
@@ -212,11 +159,11 @@ def predict(ticker: str):
 @app.get("/top10")
 def top10(max_workers: int = TOP10_WORKERS):
     now = time.time()
-    if _top10_cache["data"] and now-_top10_cache["ts"] < TOP10_CACHE_TTL_SEC:
+    if _top10_cache["data"] and now-_top10_cache["ts"] < 600:
         cached_payload = dict(_top10_cache["data"]); cached_payload["cached"]=True
         cached_payload["cached_age_sec"]=int(now-_top10_cache["ts"]); return cached_payload
 
-    tickers = []
+    tickers=[]
     if os.path.exists(TICKERS_PATH):
         with open(TICKERS_PATH,"r") as f:
             tickers = [l.strip().upper() for l in f if l.strip()]
@@ -229,7 +176,7 @@ def top10(max_workers: int = TOP10_WORKERS):
             try: results.append(fut.result())
             except: errors+=1
 
-    top_items = sorted(results, key=lambda x: (1 if x["recommendation"]=="BUY" else 0, float(x["ml_confidence"] or 0)), reverse=True)[:10]
+    top_items = sorted(results, key=lambda x: (x["recommendation"]=="BUY", float(x["ml_confidence"] or 0)), reverse=True)[:10]
     payload={"items":top_items,"total":len(results),"errors":errors,"cached":False,"computed_at_unix":int(time.time())}
     _top10_cache["ts"]=time.time(); _top10_cache["data"]=payload
     return payload
