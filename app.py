@@ -3,11 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 import requests
 import pandas as pd
 import numpy as np
-import time
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-app = FastAPI(title="Tadawul Pro Analyzer - Analyst Logic", version="5.0.0")
+app = FastAPI(title="Tadawul Pro Analyzer - Fixed", version="5.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,11 +41,19 @@ def apply_indicators(df):
     df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
     df['macd'] = df['ema12'] - df['ema26']
     df['signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+    
     # Bollinger Bands
     df['sma20'] = df['close'].rolling(20).mean()
     df['std20'] = df['close'].rolling(20).std()
     df['bb_upper'] = df['sma20'] + (df['std20'] * 2)
     df['bb_mid'] = df['sma20']
+    
+    # RSI (تمت إضافته هنا ليقرأه الكود بنجاح)
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    df['rsi'] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
+    
     # Others
     df['res_20'] = df['high'].rolling(20).max().shift(1)
     df['vol_avg'] = df['volume'].rolling(20).mean()
@@ -57,31 +64,21 @@ def analyze_one(ticker: str):
         t = ticker.strip().upper()
         if not t.endswith(".SR"): t += ".SR"
         
-        df_hour = fetch_data(t, interval="1h", period="60d")
-        if df_hour is None or len(df_hour) < 30: return None
+        df_raw = fetch_data(t, interval="1h", period="60d")
+        if df_raw is None or len(df_raw) < 30: return None
 
-        # --- الفلتر الذكي للبيانات ---
-        # إذا كان حجم تداول الشمعة الأخيرة صفر أو ضعيف جداً (وقت إغلاق)
-        # ننتقل للشمعة التي قبلها لضمان دقة المؤشرات
-        last_vol = df_hour.iloc[-1]['volume']
-        avg_vol = df_hour['volume'].tail(20).mean()
-        
-        if last_vol < (avg_vol * 0.1): # الشمعة الأخيرة "خاملة" (وقت إغلاق)
-            df_active = df_hour.iloc[:-1]
-        else:
-            df_active = df_hour # السوق مفتوح والسيولة تتدفق
+        # الفلتر الذكي: تجاهل شمعة المزاد إذا كان السوق مغلقاً
+        last_vol = df_raw.iloc[-1]['volume']
+        avg_vol = df_raw['volume'].tail(20).mean()
+        df_active = df_raw.iloc[:-1] if last_vol < (avg_vol * 0.1) else df_raw
             
         df_active = apply_indicators(df_active)
         curr = df_active.iloc[-1]
-        prev = df_active.iloc[-2]
 
-        # --- شروط "عينك" (منطق ساسكو) ---
+        # الشروط الفنية (منطق ساسكو)
         cond_macd = curr['macd'] > curr['signal']
-        # مساحة للصعود (البولينجر)
         cond_bb_space = curr['close'] < (curr['bb_mid'] + (curr['bb_upper'] - curr['bb_mid']) * 0.6)
-        # سيولة حقيقية في آخر جلسة نشطة
-        cond_vol = curr['volume'] > (df_active['volume'].rolling(20).mean().iloc[-1] * 0.9)
-        # RSI مريح
+        cond_vol = curr['volume'] > (curr['vol_avg'] * 0.9)
         cond_rsi = curr['rsi'] < 65
 
         score = 0
@@ -103,7 +100,9 @@ def analyze_one(ticker: str):
             "reason": f"M:{int(cond_macd)}|V:{int(cond_vol)}|B:{int(cond_bb_space)}",
             "status": "APPROVED" if recommendation == "BUY" else "REJECTED"
         }
-    except: return None
+    except Exception as e:
+        return {"ticker": ticker, "error": str(e), "confidence_pct": 0}
+
 @app.get("/top10")
 def top10():
     if not os.path.exists(TICKERS_PATH): return {"items": [], "error": "Missing file"}
@@ -115,10 +114,10 @@ def top10():
         futures = [executor.submit(analyze_one, t) for t in tickers]
         for fut in as_completed(futures):
             res = fut.result()
-            if res["confidence_pct"] > 0: results.append(res)
+            if res and res.get("confidence_pct", 0) >= 0:
+                results.append(res)
     
-    # ترتيب حسب القوة
-    sorted_res = sorted(results, key=lambda x: x['confidence_pct'], reverse=True)
+    sorted_res = sorted(results, key=lambda x: x.get('confidence_pct', 0), reverse=True)
     return {"items": sorted_res[:10], "total_scanned": len(results)}
 
 @app.get("/predict")
