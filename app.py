@@ -680,24 +680,62 @@ def top10(max_workers: int = TOP10_WORKERS):
         futures = {ex.submit(analyze_one, t): t for t in tickers}
         for fut in as_completed(futures):
             try:
-                results.append(fut.result())
-            except Exception:
+                res = fut.result()
+                # نتأكد أن النتيجة تحتوي على الحقول الأساسية على الأقل
+                if isinstance(res, dict) and "ticker" in res:
+                    results.append(res)
+                else:
+                    errors += 1
+            except Exception as e:
                 errors += 1
+                # يمكن تسجيل الخطأ هنا في ملف لوج
+                print(f"Error processing ticker: {e}")
 
-    # NEW: دالة ترتيب تأخذ في الاعتبار atr_pct لتقليل وزن الأسهم المتقلبة
-    def score(item):
+    # دالة ترتيب آمنة
+    def safe_score(item):
+        # القيم الافتراضية الآمنة
         rec = item.get("recommendation", "NO_TRADE")
-        confp = int(item.get("confidence_pct", 0) or 0)
-        mlc = item.get("ml_confidence")
-        mlc = float(mlc) if isinstance(mlc, (int, float)) else -1.0
-        atr_pct = item.get("atr_pct", 10.0)  # إذا لم يوجد نعطي قيمة عالية
-        atr_penalty = max(1.0, atr_pct / 2.0)  # كلما زاد ATR قل الوزن (تقسيم على 2 لضبط التأثير)
+        try:
+            confp = float(item.get("confidence_pct", 0))
+        except (TypeError, ValueError):
+            confp = 0.0
+        
+        try:
+            mlc = item.get("ml_confidence")
+            if mlc is None:
+                mlc = -1.0
+            else:
+                mlc = float(mlc)
+        except (TypeError, ValueError):
+            mlc = -1.0
+        
+        try:
+            atr_pct = float(item.get("atr_pct", 5.0))
+            if atr_pct <= 0:
+                atr_pct = 5.0  # قيمة افتراضية لمنع القسمة على صفر
+        except (TypeError, ValueError):
+            atr_pct = 5.0
+        
+        # معامل التخفيض: نريد تقليل الوزن كلما زاد ATR
+        # صيغة: penalty = max(0.5, atr_pct/2)  (أو أي صيغة مناسبة)
+        penalty = max(0.5, atr_pct / 2.0)
+        
         if rec == "BUY":
-            return (2, confp / atr_penalty, mlc / atr_penalty)
+            # نعطي أولوية للـ BUY، ثم نستخدم الثقة بعد تطبيق penalty
+            return (2, confp / penalty, mlc / penalty)
         else:
-            return (1, confp / atr_penalty, mlc / atr_penalty)
+            return (1, confp / penalty, mlc / penalty)
 
-    results_sorted = sorted(results, key=score, reverse=True)
+    # تصفية النتائج الغير صالحة (مثل التي ليس بها توصية أو entry)
+    valid_results = [r for r in results if r.get("entry") is not None]
+    # إذا أردت، يمكنك الاحتفاظ بالكل ولكن الترتيب سيعالجها.
+
+    try:
+        results_sorted = sorted(valid_results, key=safe_score, reverse=True)
+    except Exception as e:
+        # في حالة فشل الفرز، نعيد قائمة فارغة مع الخطأ
+        return {"items": [], "error": f"Sorting failed: {str(e)}", "total": len(results), "errors": errors}
+
     top_items = results_sorted[:10]
 
     payload = {
