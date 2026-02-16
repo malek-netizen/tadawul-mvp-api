@@ -56,46 +56,57 @@ def analyze_one(ticker: str):
     t = ticker.strip().upper()
     if not t.endswith(".SR"): t += ".SR"
     
-    # 1. تحليل اليومي (فلتر الاتجاه العام)
+    # 1. جلب البيانات
     df_day = fetch_data(t, interval="1d", period="1y")
-    if df_day is None or len(df_day) < 200:
-        return {"ticker": t, "recommendation": "NO_TRADE", "reason": "نقص بيانات", "confidence_pct": 0}
-    
-    df_day = apply_indicators(df_day)
-    is_trend_up = df_day.iloc[-1]['close'] > df_day.iloc[-1]['ema200']
-    
-    # 2. تحليل الساعة (فلتر التأكيد اللحظي)
     df_hour = fetch_data(t, interval="1h", period="60d")
-    if df_hour is None or len(df_hour) < 30:
+    
+    if df_day is None or df_hour is None or len(df_day) < 200 or len(df_hour) < 30:
         return {"ticker": t, "recommendation": "NO_TRADE", "reason": "نقص بيانات", "confidence_pct": 0}
+
+    # تطبيق المؤشرات الأساسية
+    df_hour = apply_indicators(df_hour)
     
     # حساب RSI
     delta = df_hour['close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     df_hour['rsi'] = 100 - (100 / (1 + (gain / loss)))
-    
-    df_hour = apply_indicators(df_hour)
+
     curr = df_hour.iloc[-1]
     prev = df_hour.iloc[-2]
-    
-    # شروط التأكيد الصارمة
-    cond_macd = (curr['macd'] > curr['signal']) and (curr['macd'] > prev['macd']) # تقاطع إيجابي حقيقي
-    cond_rsi = (curr['rsi'] < 70) and (curr['rsi'] > prev['rsi']) # قوة شرائية صاعدة وغير متضخمة
-    cond_vol = curr['volume'] > (curr['vol_avg'] * 1.10) # سيولة تأكيد (أعلى بـ 10%)
-    cond_bb = curr['close'] > curr['bb_mid'] # السعر في المنطقة الإيجابية
-    cond_res = curr['close'] >= curr['res_20'] # اختراق مقاومة قريبة
+    last_day = df_day.iloc[-1]
 
-    # توزيع النقاط (الخماسية الذهبية)
-    score = 0
-    if is_trend_up: score += 30
-    if cond_macd:   score += 20
-    if cond_rsi:    score += 15
-    if cond_vol:    score += 15
-    if cond_bb:     score += 10
-    if cond_res:    score += 10
+    # --- تطبيق "منطق المحلل" بالمعادلات الصارمة ---
+
+    # 1. الماكد: تقاطع إيجابي صريح + ميل صاعد (الأزرق فوق الأحمر والمسافة بينهم تزيد)
+    cond_macd = (curr['macd'] > curr['signal']) and (curr['macd'] - curr['signal'] > prev['macd'] - prev['signal'])
     
-    recommendation = "BUY" if score >= 75 else "NO_TRADE"
+    # 2. RSI: أقل من 70 (يمنع التشبع) + صاعد عن الساعة السابقة
+    cond_rsi = (curr['rsi'] < 70) and (curr['rsi'] > prev['rsi'])
+    
+    # 3. البولينجر: فوق المنتصف ومبتعد عن السقف (مساحة تنفس 1% على الأقل)
+    cond_bb = (curr['close'] > curr['bb_mid']) and (curr['close'] < curr['bb_upper'] * 0.99)
+    
+    # 4. السيولة: زيادة 10% + شمعة خضراء (فوليوم شرائي)
+    cond_vol = (curr['volume'] > curr['vol_avg'] * 1.10) and (curr['close'] >= curr['open'])
+    
+    # 5. المقاومة: اختراق قمة 20 ساعة مع الثبات (سعر الإغلاق الحالي فوق القمة السابقة)
+    cond_res = curr['close'] > curr['res_20']
+    
+    # 6. الاتجاه: فوق EMA 200 يومي
+    is_trend_up = last_day['close'] > last_day['ema200']
+
+    # --- توزيع النقاط (عتبة القبول 80%) ---
+    score = 0
+    if is_trend_up: score += 30 # فلتر أمان
+    if cond_macd:   score += 20 # زخم حقيقي
+    if cond_rsi:    score += 15 # قوة نسبية آمنة
+    if cond_vol:    score += 15 # سيولة دافعة
+    if cond_bb:     score += 10 # مساحة نمو
+    if cond_res:    score += 10 # اختراق مؤكد
+
+    # نرفع عتبة الشراء إلى 80 لضمان الجودة
+    recommendation = "BUY" if score >= 80 else "NO_TRADE"
     
     return {
         "ticker": t,
@@ -104,8 +115,8 @@ def analyze_one(ticker: str):
         "entry": round(float(curr['close']), 2),
         "take_profit": round(float(curr['close']) * 1.05, 2),
         "stop_loss": round(float(curr['close']) * 0.98, 2),
-        "last_close": round(float(curr['close']), 2), # تم الإصلاح
-        "reason": f"Trend:{is_trend_up}|MACD:{cond_macd}|RSI:{cond_rsi}|Vol:{cond_vol}",
+        "last_close": round(float(curr['close']), 2),
+        "reason": f"MACD:{cond_macd}|RSI:{cond_rsi}|Vol:{cond_vol}|BB_Space:{cond_bb}",
         "status": "APPROVED" if recommendation == "BUY" else "REJECTED"
     }
 @app.get("/predict")
