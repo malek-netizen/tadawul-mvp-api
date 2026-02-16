@@ -8,7 +8,7 @@ import joblib
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-app = FastAPI(title="Tadawul MVP API", version="2.2.2-stable-reversal")
+app = FastAPI(title="Tadawul MVP API", version="2.2.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,122 +23,131 @@ TICKERS_PATH = "tickers_sa.txt"
 TP_PCT = 0.05
 SL_PCT = 0.02
 ML_THRESHOLD = 0.60
-
-# --- حدود المؤشرات ---
-RSI_MIN = 40
-RSI_MAX = 65
-RSI_OVERBOUGHT = 70
+RSI_MIN, RSI_MAX, RSI_OVERBOUGHT = 40, 65, 70
 MAX_ABOVE_EMA20 = 0.06
-CONSOL_DAYS = 4
-CONSOL_RANGE_MAX = 0.06
+CONSOL_DAYS, CONSOL_RANGE_MAX = 4, 0.06
 LOOKBACK_LOW_DAYS = 10
+MIN_TREND_SCORE = 2
 
 model = None
+@app.on_event("startup")
+def load_model():
+    global model
+    if os.path.exists(MODEL_PATH):
+        try: model = joblib.load(MODEL_PATH)
+        except: model = None
 
-# ==========================================
-# NEW MODIFICATION: وظائف التأكد من الانعكاس الصاعد
-# ==========================================
-def is_reversing_up(feat_df: pd.DataFrame) -> bool:
-    """
-    شرطك الأساسي: السعر الحالي أكبر مما قبله + تكوين قاع صاعد لحظي
-    """
-    if len(feat_df) < 3:
-        return False
-    
-    c_today = float(feat_df["close"].iloc[-1])
-    c_yest = float(feat_df["close"].iloc[-2])
-    c_prev2 = float(feat_df["close"].iloc[-3])
-    
-    # 1. السعر الحالي أكبر من السابق (ليس في هبوط اليوم)
-    price_rising = c_today > c_yest
-    
-    # 2. السعر الحالي أكبر من قبل يومين (تأكيد كسر سلسلة الهبوط)
-    higher_than_prev2 = c_today > c_prev2
-    
-    return price_rising and higher_than_prev2
+# =========================
+# 1) جلب الأسعار (Yahoo Chart)
+# =========================
+def fetch_yahoo_prices(ticker: str, range_: str = "1y", interval: str = "1d"):
+    headers = {"User-Agent": "Mozilla/5.0"}
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+    try:
+        r = requests.get(url, params={"range": range_, "interval": interval}, headers=headers, timeout=15)
+        if r.status_code != 200: return None
+        js = r.json()
+        res = js['chart']['result'][0]
+        q = res['indicators']['quote'][0]
+        df = pd.DataFrame({"open": q['open'], "high": q['high'], "low": q['low'], "close": q['close'], "volume": q['volume']})
+        return df.dropna().reset_index(drop=True)
+    except: return None
 
-def is_volume_confirming(feat_df: pd.DataFrame) -> bool:
-    """
-    تأكيد أن الصعود مدعوم بسيولة أعلى من المتوسط
-    """
-    if len(feat_df) < 5:
-        return True
-    current_vol = feat_df["volume"].iloc[-1]
-    avg_vol = feat_df["volume"].tail(5).mean()
-    return current_vol >= avg_vol * 0.9  # السيولة ليست ضعيفة جداً
-
-# ==========================================
-# الدوال الأساسية (سحب البيانات، المؤشرات، إلخ)
-# ==========================================
-# (ملاحظة: أبقيت دوال sma, ema, rsi, macd, fetch_yahoo_prices كما هي في كودك الأصلي)
-# [يرجى إدراج الدوال الفنية الأصلية هنا عند التشغيل]
-
+# =========================
+# 2) المؤشرات الفنية (الأساسيات)
+# =========================
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    # (نفس دالة build_features الأصلية في كودك)
     d = df.copy()
-    # ... حساب المؤشرات ...
+    close = d["close"]
+    # المتوسطات
+    d["ema20"] = close.ewm(span=20, adjust=False).mean()
+    d["ema50"] = close.ewm(span=50, adjust=False).mean()
+    # RSI
+    delta = close.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    d["rsi14"] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
+    # MACD
+    exp1 = close.ewm(span=12, adjust=False).mean()
+    exp2 = close.ewm(span=26, adjust=False).mean()
+    d["macd"] = exp1 - exp2
+    d["macd_signal"] = d["macd"].ewm(span=9, adjust=False).mean()
+    d["macd_hist"] = d["macd"] - d["macd_signal"]
+    # الارتجاع
+    d["ret1"] = close.pct_change(1)
     return d.dropna().reset_index(drop=True)
 
-# ==========================================
-# تعديل قواعد الدخول (The Logic Update)
-# ==========================================
+# =========================
+# 3) شروطك الخاصة (تأكيد الصعود)
+# =========================
+def is_reversing_up(feat_df: pd.DataFrame) -> bool:
+    """ الشرط المطلوب: السعر الحالي أكبر من السابق وأكبر من قبل يومين """
+    if len(feat_df) < 3: return False
+    c = feat_df["close"].iloc[-1]
+    p1 = feat_df["close"].iloc[-2]
+    p2 = feat_df["close"].iloc[-3]
+    return (c > p1) and (c > p2)
+
+def is_consolidating(feat_df: pd.DataFrame) -> bool:
+    if len(feat_df) < 5: return False
+    last = feat_df.tail(4)
+    rng = (last["high"].max() - last["low"].min()) / last["close"].mean()
+    return rng <= CONSOL_RANGE_MAX
+
+# =========================
+# 4) الفلترة النهائية (The Rules)
+# =========================
 def passes_rules(df_ohlc: pd.DataFrame, feat_df: pd.DataFrame):
     reasons = []
     last = feat_df.iloc[-1]
     
-    # --- شروطك القديمة ---
-    if rsi(feat_df["close"]).iloc[-1] > RSI_OVERBOUGHT:
-        reasons.append("Rejected: RSI overbought.")
-    
-    # --- التعديل الجديد (شرط المسار الهابط) ---
+    # الشرط الأساسي الذي طلبته: منع الدخول في مسار هابط
     if not is_reversing_up(feat_df):
-        reasons.append("Rejected: Price is in a downward sequence (Wait for Green/Higher Close).")
-    
-    # التحقق من ميل المتوسط المتحرك (يجب ألا يكون منحدراً للأسفل بحدة)
-    if len(feat_df) >= 2:
-        if last["ema20"] < feat_df["ema20"].iloc[-2]:
-             # إذا كان المسار العام لـ 20 يوم هابط، نرفض الدخول إلا لو كان هناك تذبذب تجميعي
-             if not is_consolidating(feat_df):
-                reasons.append("Rejected: Long-term trend (EMA20) is still declining.")
+        reasons.append("السعر في مسار هابط أو لم يبدأ بالارتداد بعد")
 
-    # تأكيد السيولة
-    if not is_volume_confirming(feat_df):
-        reasons.append("Rejected: Low volume on reversal attempt.")
+    if last["rsi14"] > RSI_OVERBOUGHT:
+        reasons.append("تشبع شرائي RSI > 70")
+        
+    if last["close"] < last["ema20"] * 0.98: # تحت المتوسط بمسافة كبيرة
+        reasons.append("السعر تحت متوسط 20 (ترند ضعيف)")
 
-    # (باقي شروط Consolidation و Trend Score الأصلية)
-    # ...
-    
     return (len(reasons) == 0), reasons
 
-def rules_score(feat_df: pd.DataFrame) -> int:
-    # نظام النقاط المطور بناءً على شرطك
-    score = 0
-    last = feat_df.iloc[-1]
-    
-    # +25 نقطة إذا تحقق شرطك (السعر الحالي > السابق)
-    if is_reversing_up(feat_df):
-        score += 25
-    
-    # +20 نقطة إذا كان فوق المتوسطات
-    if float(last["close"]) >= float(last["ema20"]): score += 20
-    
-    # +15 نقطة للسيولة
-    if is_volume_confirming(feat_df): score += 15
-    
-    # +20 نقطة لـ RSI في النطاق الذهبي
-    r = float(last["rsi14"])
-    if 40 <= r <= 60: score += 20
-    
-    return int(min(100, score))
-
-# ==========================================
-# تحليل سهم واحد (The Final Logic)
-# ==========================================
+# =========================
+# 5) دالة التحليل الرئيسية (المصححة)
+# =========================
 def analyze_one(ticker: str):
-    # (نفس دالة analyze_one الأصلية مع استدعاء الـ Rules المحدثة)
-    # ...
-    # سيقوم الآن تلقائياً برفض أي سهم "إغلاقه اليوم أقل من أمس"
-    # وسيعطيه حالة REJECTED مع ذكر السبب في الـ reason
-    pass
+    t = ticker.strip().upper()
+    if not t.endswith(".SR"): t += ".SR"
+    
+    df = fetch_yahoo_prices(t)
+    if df is None or len(df) < 30:
+        return {"ticker": t, "recommendation": "NO_TRADE", "reason": "بيانات غير كافية"}
 
-# (باقي دوال FastAPI و /top10 تبقى كما هي)
+    feat_df = build_features(df)
+    last_close = float(feat_df["close"].iloc[-1])
+    
+    # تشغيل الفلاتر
+    ok, reasons = passes_rules(df, feat_df)
+    
+    # حساب النقاط
+    score = 0
+    if is_reversing_up(feat_df): score += 40
+    if last_close > feat_df["ema20"].iloc[-1]: score += 30
+    if 40 < feat_df["rsi14"].iloc[-1] < 65: score += 30
+
+    recommendation = "BUY" if (ok and score >= 70) else "NO_TRADE"
+    
+    return {
+        "ticker": t,
+        "recommendation": recommendation,
+        "confidence_pct": score,
+        "entry": round(last_close, 2),
+        "reason": " | ".join(reasons) if reasons else "إشارة دخول مؤكدة",
+        "last_close": round(last_close, 2)
+    }
+
+# إبقاء Endpoints الأخرى كما هي...
+@app.get("/predict")
+def predict(ticker: str):
+    return analyze_one(ticker)
