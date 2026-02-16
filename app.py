@@ -139,7 +139,8 @@ def top10():
         futures = [executor.submit(analyze_one, t) for t in tickers]
         for fut in as_completed(futures):
             res = fut.result()
-            if res['recommendation'] == "BUY": results.append(res)
+            # سيجلب كل الأسهم التي فحصها، ثم سنرتبها لنأخذ الأفضل
+results.append(res)
     
     # ترتيب حسب الثقة
     sorted_res = sorted(results, key=lambda x: x['confidence_pct'], reverse=True)
