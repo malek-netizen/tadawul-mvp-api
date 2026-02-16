@@ -66,40 +66,47 @@ def analyze_one(ticker: str):
         df_raw = fetch_data(t, interval="1h", period="60d")
         if df_raw is None or len(df_raw) < 30: return None
 
-        # الفلتر الذكي: تجاوز شمعة المزاد لو السوق مقفل
+        # الفلتر الذكي للبيانات النشطة
         last_vol = df_raw.iloc[-1]['volume']
-        avg_vol_l = df_raw['volume'].tail(20).mean()
-        df_active = df_raw.iloc[:-1] if last_vol < (avg_vol_l * 0.1) else df_raw
+        avg_vol_20 = df_raw['volume'].tail(20).mean()
+        df_active = df_raw.iloc[:-1] if last_vol < (avg_vol_20 * 0.1) else df_raw
             
         df_active = apply_indicators(df_active)
         curr = df_active.iloc[-1]
         prev = df_active.iloc[-2]
 
-        # --- شروط "منطق ساسكو" مع فلاتر الأمان ---
-        
-        # 1. الماكد: تقاطع إيجابي + فجوة تتوسع (زخم صاعد)
-        macd_gap = curr['macd'] - curr['signal']
-        prev_macd_gap = prev['macd'] - prev['signal']
-        cond_macd = (curr['macd'] > curr['signal']) and (macd_gap > prev_macd_gap)
+        # --- [1] منطق الماكد: استدارة من الصفر ---
+        # تقاطع إيجابي ويجب أن يكون الماكد في منطقة منخفضة (قرب القاع)
+        cond_macd_bottom = (curr['macd'] > curr['signal']) and (prev['macd'] <= prev['signal']) and (curr['macd'] < 0.1)
 
-        # 2. RSI: صاعد (أعلى من السابق) + تحت الـ 60 (يستبعد الأهلي المتضخم)
-        cond_rsi = (curr['rsi'] > prev['rsi']) and (curr['rsi'] < 60)
+        # --- [2] منطق البولينجر: اختراق المنتصف بعد ضغط ---
+        # السعر يخترق خط المنتصف (sma20) للأعلى
+        cond_bb_break = (curr['close'] > curr['bb_mid']) and (prev['close'] <= prev['bb_mid'])
+        # السعر كان يزحف قرب القاع (تحت خط المنتصف) في الـ 5 ساعات الماضية
+        was_below_mid = (df_active['close'].shift(1).tail(5) < df_active['bb_mid'].shift(1).tail(5)).any()
 
-        # 3. الأمان: السعر غير متضخم (قريب من المتوسط بحد أقصى 3%)
-        is_not_extended = (curr['close'] < curr['sma20'] * 1.03)
+        # --- [3] منطق المتوسطات: استدارة الاتجاه ---
+        # التأكد أن المتوسط نفسه بدأ ينحني للأعلى وليس هابطاً
+        is_ma_turning = curr['sma20'] >= df_active.iloc[-4]['sma20']
 
-        # 4. السيولة والمساحة
-        cond_vol = curr['volume'] > (curr['vol_avg'] * 0.8) # مرونة بسيطة في السيولة
-        cond_bb_space = curr['close'] < (curr['bb_mid'] + (curr['bb_upper'] - curr['bb_mid']) * 0.5)
+        # --- [4] منطق RSI: الهروب من الخمول ---
+        # RSI صاعد وكان تحت الـ 45 قريباً
+        rsi_was_low = (df_active['rsi'].shift(1).tail(10) < 45).any()
+        cond_rsi_rebound = rsi_was_low and (curr['rsi'] > prev['rsi'])
 
+        # --- [5] السيولة: تأكيد الاختراق ---
+        cond_vol_surge = curr['volume'] > (curr['vol_avg'] * 1.2)
+
+        # ميزان النقاط الاحترافي
         score = 0
-        if cond_macd:       score += 30
-        if cond_rsi:        score += 30
-        if is_not_extended: score += 20
-        if cond_vol:        score += 10
-        if cond_bb_space:   score += 10
+        if cond_macd_bottom:  score += 35 # استدارة الماكد
+        if cond_bb_break:    score += 20 # اختراق نقطة التحول
+        if was_below_mid:    score += 10 # تأكيد أنه قادم من أسفل
+        if is_ma_turning:    score += 15 # استدارة الاتجاه
+        if cond_rsi_rebound: score += 10 # الهروب من التشبع
+        if cond_vol_surge:   score += 10 # تأكيد السيولة
 
-        recommendation = "BUY" if score >= 80 else "NO_TRADE"
+        recommendation = "BUY" if score >= 75 else "NO_TRADE"
 
         return {
             "ticker": t,
@@ -108,13 +115,11 @@ def analyze_one(ticker: str):
             "entry": round(float(curr['close']), 2),
             "take_profit": round(float(curr['close']) * 1.05, 2),
             "stop_loss": round(float(curr['close']) * 0.97, 2),
-            "last_close": round(float(curr['close']), 2),
-            "reason": f"M:{int(cond_macd)}|R:{int(cond_rsi)}|Safe:{int(is_not_extended)}",
+            "reason": f"M:{int(cond_macd_bottom)}|B:{int(cond_bb_break)}|V:{int(cond_vol_surge)}|MA:{int(is_ma_turning)}",
             "status": "APPROVED" if recommendation == "BUY" else "REJECTED"
         }
     except:
         return None
-
 @app.get("/top10")
 def top10():
     if not os.path.exists(TICKERS_PATH): return {"items": [], "error": "Missing file"}
