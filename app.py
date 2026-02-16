@@ -54,62 +54,51 @@ def apply_indicators(df):
 
 def analyze_one(ticker: str):
     t = ticker.strip().upper()
-    # تعديل ذكي للتعامل مع .SR الموجودة في ملفك
-    if not t.endswith(".SR"): 
-        t += ".SR"
+    if not t.endswith(".SR"): t += ".SR"
     
-    # 1. فلتر الفريم اليومي
     df_day = fetch_data(t, interval="1d", period="1y")
     if df_day is None or len(df_day) < 200:
-        return {"ticker": t, "recommendation": "NO_TRADE", "reason": "بيانات اليومي غير كافية"}
+        return {"ticker": t, "recommendation": "NO_TRADE", "reason": "نقص بيانات"}
     
     df_day = apply_indicators(df_day)
     last_day = df_day.iloc[-1]
     is_trend_up = last_day['close'] > last_day['ema200']
     
-    # 2. تحليل فريم الساعة
     df_hour = fetch_data(t, interval="1h", period="60d")
     if df_hour is None or len(df_hour) < 30:
-        return {"ticker": t, "recommendation": "NO_TRADE", "reason": "بيانات الساعة غير كافية"}
+        return {"ticker": t, "recommendation": "NO_TRADE", "reason": "نقص بيانات"}
     
     df_hour = apply_indicators(df_hour)
     curr = df_hour.iloc[-1]
     prev = df_hour.iloc[-2]
     
+    # شروط مرنة
     cond_macd = curr['macd'] > prev['macd']
-    cond_vol = curr['volume'] > (curr['vol_avg'] * 1.2)
-    cond_bb = curr['close'] >= curr['bb_mid']
-    cond_res = curr['close'] > curr['res_20']
+    cond_vol = curr['volume'] > (curr['vol_avg'] * 1.05) # خفضنا الشرط لـ 5% للทดريب
+    cond_bb = curr['close'] > curr['bb_mid']
+    cond_res = curr['close'] >= curr['res_20']
     
-    entry = float(curr['close'])
-    tp = entry * (1 + TP_PCT)
-    sl = entry * (1 - SL_PCT)
-    
+    # توزيع نقاط جديد (Total 100)
     score = 0
-    reasons = []
-    if not is_trend_up: reasons.append("الاتجاه اليومي هابط")
-    if cond_macd: score += 25
-    else: reasons.append("الماكد هابط")
-    if cond_vol: score += 25
-    else: reasons.append("سيولة ضعيفة")
-    if cond_bb: score += 25
-    if cond_res: score += 25
-    else: reasons.append("لم يخترق المقاومة")
-
-    recommendation = "BUY" if (is_trend_up and score >= 75) else "NO_TRADE"
+    if is_trend_up: score += 40
+    if cond_macd:   score += 15
+    if cond_bb:     score += 15
+    if cond_res:    score += 15
+    if cond_vol:    score += 15
+    
+    # توصية شراء إذا تجاوز 70%
+    recommendation = "BUY" if score >= 70 else "NO_TRADE"
     
     return {
         "ticker": t,
         "recommendation": recommendation,
-        "confidence_pct": score if is_trend_up else score // 2,
-        "entry": round(entry, 2),
-        "take_profit": round(tp, 2),
-        "stop_loss": round(sl, 2),
-        "reason": " | ".join(reasons) if reasons else "إشارة دخول مكتملة",
-        "last_close": round(entry, 2),
+        "confidence_pct": score,
+        "entry": round(float(curr['close']), 2),
+        "take_profit": round(float(curr['close']) * 1.05, 2),
+        "stop_loss": round(float(curr['close']) * 0.98, 2),
+        "reason": f"Trend:{'UP' if is_trend_up else 'DOWN'}|MACD:{cond_macd}|Vol:{cond_vol}",
         "status": "APPROVED" if recommendation == "BUY" else "REJECTED"
     }
-
 @app.get("/predict")
 def predict(ticker: str):
     return analyze_one(ticker)
