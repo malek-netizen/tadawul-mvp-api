@@ -7,7 +7,7 @@ import time
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-app = FastAPI(title="Tadawul Pro Analyzer", version="3.0.0")
+app = FastAPI(title="Tadawul Pro Analyzer", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,7 +20,6 @@ TICKERS_PATH = "tickers_sa.txt"
 TP_PCT = 0.05
 SL_PCT = 0.02
 
-# دالة جلب البيانات من ياهو (تم تحديثها لدعم فريم الساعة واليوم)
 def fetch_data(ticker: str, interval="1h", period="60d"):
     bases = ["https://query1.finance.yahoo.com/v8/finance/chart/", "https://query2.finance.yahoo.com/v8/finance/chart/"]
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -39,45 +38,36 @@ def fetch_data(ticker: str, interval="1h", period="60d"):
         except: continue
     return None
 
-# حساب المؤشرات الفنية
 def apply_indicators(df):
-    # الماكد
     df['ema12'] = df['close'].ewm(span=12).mean()
     df['ema26'] = df['close'].ewm(span=26).mean()
     df['macd'] = df['ema12'] - df['ema26']
     df['signal'] = df['macd'].ewm(span=9).mean()
-    
-    # البولينجر باند
     df['sma20'] = df['close'].rolling(20).mean()
     df['std20'] = df['close'].rolling(20).std()
     df['bb_upper'] = df['sma20'] + (df['std20'] * 2)
     df['bb_mid'] = df['sma20']
-    
-    # المتوسطات الثقيلة (لليومي)
     df['ema200'] = df['close'].ewm(span=200).mean()
-    
-    # المقاومة الأفقية (أعلى سعر في آخر 20 شمعة)
     df['res_20'] = df['high'].rolling(20).max().shift(1)
-    
-    # متوسط السيولة
     df['vol_avg'] = df['volume'].rolling(20).mean()
     return df
 
 def analyze_one(ticker: str):
     t = ticker.strip().upper()
-    if not t.endswith(".SR"): t += ".SR"
+    # تعديل ذكي للتعامل مع .SR الموجودة في ملفك
+    if not t.endswith(".SR"): 
+        t += ".SR"
     
-    # 1. فلتر الفريم اليومي (الاتجاه العام)
+    # 1. فلتر الفريم اليومي
     df_day = fetch_data(t, interval="1d", period="1y")
     if df_day is None or len(df_day) < 200:
         return {"ticker": t, "recommendation": "NO_TRADE", "reason": "بيانات اليومي غير كافية"}
     
     df_day = apply_indicators(df_day)
     last_day = df_day.iloc[-1]
-    
     is_trend_up = last_day['close'] > last_day['ema200']
     
-    # 2. تحليل فريم الساعة (التنفيذ)
+    # 2. تحليل فريم الساعة
     df_hour = fetch_data(t, interval="1h", period="60d")
     if df_hour is None or len(df_hour) < 30:
         return {"ticker": t, "recommendation": "NO_TRADE", "reason": "بيانات الساعة غير كافية"}
@@ -86,29 +76,25 @@ def analyze_one(ticker: str):
     curr = df_hour.iloc[-1]
     prev = df_hour.iloc[-2]
     
-    # فحص الشروط الاحترافية
-    cond_macd = curr['macd'] > prev['macd'] # انحناء للأعلى
-    cond_vol = curr['volume'] > (curr['vol_avg'] * 1.2) # سيولة +20%
-    cond_bb = curr['close'] >= curr['bb_mid'] # فوق منتصف البولينجر (قوة)
-    cond_res = curr['close'] > curr['res_20'] # اختراق مقاومة أفقية
+    cond_macd = curr['macd'] > prev['macd']
+    cond_vol = curr['volume'] > (curr['vol_avg'] * 1.2)
+    cond_bb = curr['close'] >= curr['bb_mid']
+    cond_res = curr['close'] > curr['res_20']
     
-    # حساب الأهداف
     entry = float(curr['close'])
     tp = entry * (1 + TP_PCT)
     sl = entry * (1 - SL_PCT)
     
-    # منطق القرار النهائي
     score = 0
     reasons = []
-    
-    if not is_trend_up: reasons.append("الاتجاه اليومي هابط (تحت EMA 200)")
+    if not is_trend_up: reasons.append("الاتجاه اليومي هابط")
     if cond_macd: score += 25
-    else: reasons.append("الماكد منحني لأسفل")
+    else: reasons.append("الماكد هابط")
     if cond_vol: score += 25
-    else: reasons.append("ضعف في السيولة")
+    else: reasons.append("سيولة ضعيفة")
     if cond_bb: score += 25
     if cond_res: score += 25
-    else: reasons.append("لم يتم اختراق المقاومة الأفقية")
+    else: reasons.append("لم يخترق المقاومة")
 
     recommendation = "BUY" if (is_trend_up and score >= 75) else "NO_TRADE"
     
@@ -119,7 +105,7 @@ def analyze_one(ticker: str):
         "entry": round(entry, 2),
         "take_profit": round(tp, 2),
         "stop_loss": round(sl, 2),
-        "reason": " | ".join(reasons) if reasons else "جميع الشروط محققة - دخول قوي",
+        "reason": " | ".join(reasons) if reasons else "إشارة دخول مكتملة",
         "last_close": round(entry, 2),
         "status": "APPROVED" if recommendation == "BUY" else "REJECTED"
     }
@@ -130,7 +116,7 @@ def predict(ticker: str):
 
 @app.get("/top10")
 def top10():
-    if not os.path.exists(TICKERS_PATH): return {"items": [], "error": "ملف الأسهم مفقود"}
+    if not os.path.exists(TICKERS_PATH): return {"items": [], "error": "الملف مفقود"}
     with open(TICKERS_PATH, "r") as f:
         tickers = [line.strip() for line in f if line.strip()]
     
@@ -139,13 +125,13 @@ def top10():
         futures = [executor.submit(analyze_one, t) for t in tickers]
         for fut in as_completed(futures):
             res = fut.result()
-            # سيجلب كل الأسهم التي فحصها، ثم سنرتبها لنأخذ الأفضل
-results.append(res)
+            # صرامة: فقط الأسهم الجاهزة للشراء
+            if res['recommendation'] == "BUY": 
+                results.append(res)
     
-    # ترتيب حسب الثقة
     sorted_res = sorted(results, key=lambda x: x['confidence_pct'], reverse=True)
     return {"items": sorted_res[:10], "total": len(results)}
 
 @app.get("/health")
 def health():
-    return {"status": "Online", "strategy": "Daily Filter + Hourly Entry", "target": "5%", "stop": "2%"}
+    return {"status": "Online"}
