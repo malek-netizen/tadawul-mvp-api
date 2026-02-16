@@ -116,22 +116,33 @@ def predict(ticker: str):
 
 @app.get("/top10")
 def top10():
-    if not os.path.exists(TICKERS_PATH): return {"items": [], "error": "الملف مفقود"}
+    if not os.path.exists(TICKERS_PATH): 
+        return {"items": [], "error": "ملف الأسهم مفقود"}
+    
     with open(TICKERS_PATH, "r") as f:
         tickers = [line.strip() for line in f if line.strip()]
     
     results = []
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    # رفعنا عدد العمال لـ 15 لتسريع مسح السوق كاملاً
+    with ThreadPoolExecutor(max_workers=15) as executor:
         futures = [executor.submit(analyze_one, t) for t in tickers]
         for fut in as_completed(futures):
-            res = fut.result()
-            # صرامة: فقط الأسهم الجاهزة للشراء
-            if res['recommendation'] == "BUY": 
-                results.append(res)
+            try:
+                res = fut.result()
+                # نستبعد فقط الأسهم التي فشل جلب بياناتها تماماً
+                if "بيانات" not in res.get("reason", ""):
+                    results.append(res)
+            except:
+                continue
     
+    # الترتيب: الأعلى ثقة في البداية (حتى لو لم تكن BUY)
     sorted_res = sorted(results, key=lambda x: x['confidence_pct'], reverse=True)
-    return {"items": sorted_res[:10], "total": len(results)}
-
+    
+    # نأخذ أفضل 10 فرص موجودة في السوق حالياً
+    top_items = sorted_res[:10]
+    
+    return {"items": top_items, "total_scanned": len(results)}
+    
 @app.get("/health")
 def health():
     return {"status": "Online"}
