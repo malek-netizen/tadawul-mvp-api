@@ -56,38 +56,46 @@ def analyze_one(ticker: str):
     t = ticker.strip().upper()
     if not t.endswith(".SR"): t += ".SR"
     
+    # 1. تحليل اليومي (فلتر الاتجاه العام)
     df_day = fetch_data(t, interval="1d", period="1y")
     if df_day is None or len(df_day) < 200:
-        return {"ticker": t, "recommendation": "NO_TRADE", "reason": "نقص بيانات"}
+        return {"ticker": t, "recommendation": "NO_TRADE", "reason": "نقص بيانات", "confidence_pct": 0}
     
     df_day = apply_indicators(df_day)
-    last_day = df_day.iloc[-1]
-    is_trend_up = last_day['close'] > last_day['ema200']
+    is_trend_up = df_day.iloc[-1]['close'] > df_day.iloc[-1]['ema200']
     
+    # 2. تحليل الساعة (فلتر التأكيد اللحظي)
     df_hour = fetch_data(t, interval="1h", period="60d")
     if df_hour is None or len(df_hour) < 30:
-        return {"ticker": t, "recommendation": "NO_TRADE", "reason": "نقص بيانات"}
+        return {"ticker": t, "recommendation": "NO_TRADE", "reason": "نقص بيانات", "confidence_pct": 0}
+    
+    # حساب RSI
+    delta = df_hour['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    df_hour['rsi'] = 100 - (100 / (1 + (gain / loss)))
     
     df_hour = apply_indicators(df_hour)
     curr = df_hour.iloc[-1]
     prev = df_hour.iloc[-2]
     
-    # شروط مرنة
-    cond_macd = curr['macd'] > prev['macd']
-    cond_vol = curr['volume'] > (curr['vol_avg'] * 1.05) # خفضنا الشرط لـ 5% للทดريب
-    cond_bb = curr['close'] > curr['bb_mid']
-    cond_res = curr['close'] >= curr['res_20']
-    
-    # توزيع نقاط جديد (Total 100)
+    # شروط التأكيد الصارمة
+    cond_macd = (curr['macd'] > curr['signal']) and (curr['macd'] > prev['macd']) # تقاطع إيجابي حقيقي
+    cond_rsi = (curr['rsi'] < 70) and (curr['rsi'] > prev['rsi']) # قوة شرائية صاعدة وغير متضخمة
+    cond_vol = curr['volume'] > (curr['vol_avg'] * 1.10) # سيولة تأكيد (أعلى بـ 10%)
+    cond_bb = curr['close'] > curr['bb_mid'] # السعر في المنطقة الإيجابية
+    cond_res = curr['close'] >= curr['res_20'] # اختراق مقاومة قريبة
+
+    # توزيع النقاط (الخماسية الذهبية)
     score = 0
-    if is_trend_up: score += 40
-    if cond_macd:   score += 15
-    if cond_bb:     score += 15
-    if cond_res:    score += 15
+    if is_trend_up: score += 30
+    if cond_macd:   score += 20
+    if cond_rsi:    score += 15
     if cond_vol:    score += 15
+    if cond_bb:     score += 10
+    if cond_res:    score += 10
     
-    # توصية شراء إذا تجاوز 70%
-    recommendation = "BUY" if score >= 70 else "NO_TRADE"
+    recommendation = "BUY" if score >= 75 else "NO_TRADE"
     
     return {
         "ticker": t,
@@ -96,7 +104,8 @@ def analyze_one(ticker: str):
         "entry": round(float(curr['close']), 2),
         "take_profit": round(float(curr['close']) * 1.05, 2),
         "stop_loss": round(float(curr['close']) * 0.98, 2),
-        "reason": f"Trend:{'UP' if is_trend_up else 'DOWN'}|MACD:{cond_macd}|Vol:{cond_vol}",
+        "last_close": round(float(curr['close']), 2), # تم الإصلاح
+        "reason": f"Trend:{is_trend_up}|MACD:{cond_macd}|RSI:{cond_rsi}|Vol:{cond_vol}",
         "status": "APPROVED" if recommendation == "BUY" else "REJECTED"
     }
 @app.get("/predict")
