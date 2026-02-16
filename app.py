@@ -53,72 +53,69 @@ def apply_indicators(df):
     return df
 
 def analyze_one(ticker: str):
-    t = ticker.strip().upper()
-    if not t.endswith(".SR"): t += ".SR"
-    
-    df_day = fetch_data(t, interval="1d", period="1y")
-    time.sleep(0.05)
-    df_hour = fetch_data(t, interval="1h", period="60d")
-    
-    if df_day is None or df_hour is None or len(df_day) < 200 or len(df_hour) < 30:
-        return {"ticker": t, "recommendation": "NO_TRADE", "reason": "بيانات غير كافية", "confidence_pct": 0}
+    try:
+        t = ticker.strip().upper()
+        if not t.endswith(".SR"): t += ".SR"
+        
+        # جلب بيانات الساعة (كافية للمضاربة السريعة)
+        df_hour = fetch_data(t, interval="1h", period="60d")
+        if df_hour is None or len(df_hour) < 30: return None
 
-    df_hour = apply_indicators(df_hour)
-    
-    # حساب RSI
-    delta = df_hour['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    df_hour['rsi'] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
+        df_hour = apply_indicators(df_hour)
+        
+        # حساب RSI
+        delta = df_hour['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        df_hour['rsi'] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
 
-    curr = df_hour.iloc[-1]
-    prev = df_hour.iloc[-2]
-    
-    # 1. الاتجاه العام (يومي)
-    ema200_day = df_day['close'].ewm(span=200).mean().iloc[-1]
-    is_trend_up = df_day.iloc[-1]['close'] > ema200_day
+        curr = df_hour.iloc[-1]
+        prev = df_hour.iloc[-2]
+        
+        # --- منطق "صياد الارتدادات" (بدون EMA 200) ---
+        
+        # 1. الاتجاه اللحظي (فوق متوسط 20 ساعة) - لضمان أن السهم بدأ يتحرك
+        is_short_up = curr['close'] > curr['sma20']
+        
+        # 2. الماكد: تقاطع + اتساع (أهم شرط للارتداد)
+        cond_macd = (curr['macd'] > curr['signal']) and (curr['macd'] - curr['signal'] > prev['macd'] - prev['signal'])
+        
+        # 3. RSI: آمن (تحت 70) وصاعد
+        cond_rsi = (curr['rsi'] < 70) and (curr['rsi'] > prev['rsi'])
+        
+        # 4. السيولة: وقود الارتداد (أعلى من المتوسط بـ 10%)
+        cond_vol = (curr['volume'] > curr['vol_avg'] * 1.10) and (curr['close'] >= curr['open'])
+        
+        # 5. البولينجر: مساحة للهدف (السعر لم يلمس السقف بعد)
+        cond_bb = (curr['close'] > curr['bb_mid']) and (curr['close'] < curr['bb_upper'] * 0.99)
+        
+        # 6. المقاومة: اختراق قمة الـ 20 ساعة الماضية
+        cond_res = curr['close'] > curr['res_20']
 
-    # --- تطبيق معادلات "منطق المحلل" الصارمة ---
-    
-    # الماكد: تقاطع إيجابي + الفجوة تتسع (زحم متسارع)
-    cond_macd = (curr['macd'] > curr['signal']) and (curr['macd'] - curr['signal'] > prev['macd'] - prev['signal'])
-    
-    # RSI: تحت الـ 70 + صعود (قوة غير منهكة)
-    cond_rsi = (curr['rsi'] < 70) and (curr['rsi'] > prev['rsi'])
-    
-    # البولينجر: فوق المنتصف + مساحة تنفس (أقل من السقف بـ 1%)
-    cond_bb = (curr['close'] > curr['bb_mid']) and (curr['close'] < curr['bb_upper'] * 0.99)
-    
-    # السيولة: +10% + شمعة شرائية (خضراء)
-    cond_vol = (curr['volume'] > curr['vol_avg'] * 1.10) and (curr['close'] >= curr['open'])
-    
-    # المقاومة: اختراق قمة 20 ساعة
-    cond_res = curr['close'] > curr['res_20']
+        # توزيع النقاط الجديد (تركيز 50% على الزخم والسيولة)
+        score = 0
+        if is_short_up: score += 10 # اتجاه لحظي بسيط
+        if cond_macd:   score += 30 # (رفعنا الوزن) تأكيد بداية الموجة
+        if cond_rsi:    score += 15
+        if cond_vol:    score += 25 # (رفعنا الوزن) تأكيد دخول السيولة
+        if cond_bb:     score += 10
+        if cond_res:    score += 10
 
-    # حساب النقاط (الوزن الكلي 100)
-    score = 0
-    if is_trend_up: score += 30
-    if cond_macd:   score += 20
-    if cond_rsi:    score += 15
-    if cond_vol:    score += 15
-    if cond_bb:     score += 10
-    if cond_res:    score += 10
+        # عتبة القبول للمضاربة
+        recommendation = "BUY" if score >= 75 else "NO_TRADE"
 
-    # عتبة القبول: 80% (لا نقبل إلا الممتاز)
-    recommendation = "BUY" if score >= 80 else "NO_TRADE"
-    
-    return {
-        "ticker": t,
-        "recommendation": recommendation,
-        "confidence_pct": score,
-        "entry": round(float(curr['close']), 2),
-        "take_profit": round(float(curr['close']) * 1.05, 2),
-        "stop_loss": round(float(curr['close']) * 0.98, 2),
-        "last_close": round(float(curr['close']), 2),
-        "reason": f"M:{int(cond_macd)}|R:{int(cond_rsi)}|V:{int(cond_vol)}|B:{int(cond_bb)}",
-        "status": "APPROVED" if recommendation == "BUY" else "REJECTED"
-    }
-
+        return {
+            "ticker": t,
+            "recommendation": recommendation,
+            "confidence_pct": score,
+            "entry": round(float(curr['close']), 2),
+            "take_profit": round(float(curr['close']) * 1.05, 2),
+            "stop_loss": round(float(curr['close']) * 0.97, 2), # وقف خسارة قريب لزيادة الأمان
+            "last_close": round(float(curr['close']), 2),
+            "reason": f"M:{int(cond_macd)}|V:{int(cond_vol)}|R:{int(cond_rsi)}|B:{int(cond_bb)}",
+            "status": "APPROVED" if recommendation == "BUY" else "REJECTED"
+        }
+    except: return None
 @app.get("/top10")
 def top10():
     if not os.path.exists(TICKERS_PATH): return {"items": [], "error": "Missing file"}
