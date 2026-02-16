@@ -100,51 +100,63 @@ def is_consolidating(feat_df: pd.DataFrame) -> bool:
 def passes_rules(df_ohlc: pd.DataFrame, feat_df: pd.DataFrame):
     reasons = []
     last = feat_df.iloc[-1]
+    prev = feat_df.iloc[-2]
     
-    # الشرط الأساسي الذي طلبته: منع الدخول في مسار هابط
-    if not is_reversing_up(feat_df):
-        reasons.append("السعر في مسار هابط أو لم يبدأ بالارتداد بعد")
+    # 1. شرط السعر المرن (الجديد)
+    # نسمح بالدخول إذا كان السعر صاعداً، أو إذا كان مستقراً مع زخم فني
+    is_price_ok = last["close"] >= prev["close"] * 0.995 # يسمح بهبوط طفيف جداً 0.5% (تذبذب طبيعي)
+    
+    # 2. فحص الزخم (MACD Histogram)
+    # إذا كان الهيستوجرام ينمو للأعلى، فهذا يعني أن البائعين فقدوا السيطرة
+    is_momentum_rising = last["macd_hist"] > prev["macd_hist"]
 
-    if last["rsi14"] > RSI_OVERBOUGHT:
-        reasons.append("تشبع شرائي RSI > 70")
+    if not is_price_ok and not is_momentum_rising:
+        reasons.append("السعر في هبوط حاد والزخم ضعيف")
+
+    if last["rsi14"] > 70:
+        reasons.append("تشبع شرائي كبير - خطر")
         
-    if last["close"] < last["ema20"] * 0.98: # تحت المتوسط بمسافة كبيرة
-        reasons.append("السعر تحت متوسط 20 (ترند ضعيف)")
+    if last["rsi14"] < 30:
+        reasons.append("السهم في منطقة انهيار - انتظر إشارة ارتداد")
 
     return (len(reasons) == 0), reasons
 
-# =========================
-# 5) دالة التحليل الرئيسية (المصححة)
-# =========================
 def analyze_one(ticker: str):
-    t = ticker.strip().upper()
-    if not t.endswith(".SR"): t += ".SR"
-    
+    # ... (كود جلب البيانات كما هو) ...
     df = fetch_yahoo_prices(t)
-    if df is None or len(df) < 30:
-        return {"ticker": t, "recommendation": "NO_TRADE", "reason": "بيانات غير كافية"}
+    if df is None or len(df) < 30: return {"ticker": t, "status": "بيانات ناقصة"}
 
     feat_df = build_features(df)
-    last_close = float(feat_df["close"].iloc[-1])
+    last = feat_df.iloc[-1]
+    prev = feat_df.iloc[-2]
+
+    # حساب النقاط بناءً على الاقتراح الجديد:
+    score = 0
     
-    # تشغيل الفلاتر
+    # أ) نقاط السعر (30 نقطة)
+    if last["close"] > prev["close"]: score += 30
+    elif last["close"] >= prev["close"] * 0.998: score += 15 # نقاط أقل للاستقرار
+    
+    # ب) نقاط MACD (توقع الانفجار) (35 نقطة)
+    if last["macd_hist"] > prev["macd_hist"]: score += 35
+    
+    # ج) نقاط المتوسطات (20 نقطة)
+    if last["close"] > last["ema20"]: score += 20
+    
+    # د) نقاط RSI (15 نقطة)
+    if 45 <= last["rsi14"] <= 65: score += 15
+
     ok, reasons = passes_rules(df, feat_df)
     
-    # حساب النقاط
-    score = 0
-    if is_reversing_up(feat_df): score += 40
-    if last_close > feat_df["ema20"].iloc[-1]: score += 30
-    if 40 < feat_df["rsi14"].iloc[-1] < 65: score += 30
-
-    recommendation = "BUY" if (ok and score >= 70) else "NO_TRADE"
+    # قرار الدخول: إذا حصل على أكثر من 65 نقطة واجتاز الفلاتر
+    recommendation = "BUY" if (ok and score >= 65) else "NO_TRADE"
     
     return {
         "ticker": t,
         "recommendation": recommendation,
         "confidence_pct": score,
-        "entry": round(last_close, 2),
-        "reason": " | ".join(reasons) if reasons else "إشارة دخول مؤكدة",
-        "last_close": round(last_close, 2)
+        "reason": " | ".join(reasons) if reasons else "تجميع إيجابي وزخم صاعد",
+        "last_close": round(float(last["close"]), 2)
     }
 
 # إبقاء Endpoints الأخرى كما هي...
