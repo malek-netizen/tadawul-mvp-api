@@ -26,10 +26,10 @@ TICKERS_PATH = os.getenv("TICKERS_PATH", "tickers_sa.txt")
 TP_PCT = float(os.getenv("TP_PCT", "0.05"))
 TOP10_WORKERS = int(os.getenv("TOP10_WORKERS", "10"))
 CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "600"))
-MIN_VOLUME = int(os.getenv("MIN_VOLUME", "500000"))
-MIN_PRICE = float(os.getenv("MIN_PRICE", "10.0"))
-ATR_EXCLUDE_PCT = float(os.getenv("ATR_EXCLUDE_PCT", "3.0"))
-MAX_5DAY_GAIN = float(os.getenv("MAX_5DAY_GAIN", "0.10"))
+MIN_VOLUME = int(os.getenv("MIN_VOLUME", "250000"))      # تم التخفيض
+MIN_PRICE = float(os.getenv("MIN_PRICE", "5.0"))         # تم التخفيض
+ATR_EXCLUDE_PCT = float(os.getenv("ATR_EXCLUDE_PCT", "4.0"))  # تم الرفع
+MAX_5DAY_GAIN = float(os.getenv("MAX_5DAY_GAIN", "0.15"))      # تم الرفع
 
 # ======================== كاش بسيط يدوي ========================
 _prices_cache = {}
@@ -291,13 +291,16 @@ def passes_core_rules(feat_df: pd.DataFrame) -> tuple[bool, list[str]]:
         reasons.append("السعر تحت SMA50")
     if not (curr["macd"] > curr["macd_signal"]):
         reasons.append("MACD أقل من Signal")
-    if not (curr["volume"] > 1.5 * curr["vol_ma20"]):
-        reasons.append("حجم التداول أقل من 1.5x المتوسط")
-    if not (40 < curr["rsi14"] < 70):
+    # تغيير النسبة من 1.5 إلى 1.2
+    if not (curr["volume"] > 1.2 * curr["vol_ma20"]):
+        reasons.append("حجم التداول أقل من 1.2x المتوسط")
+    # توسيع نطاق RSI
+    if not (30 < curr["rsi14"] < 75):
         reasons.append(f"RSI خارج النطاق ({curr['rsi14']:.1f})")
     dist = (curr["close"] - curr["ema20"]) / curr["ema20"]
-    if dist > 0.05:
-        reasons.append("السعر بعيد جداً عن المتوسط (>5%)")
+    # رفع الحد المسموح به إلى 7%
+    if dist > 0.07:
+        reasons.append("السعر بعيد جداً عن المتوسط (>7%)")
     passed = len(reasons) == 0
     return passed, reasons
 
@@ -328,13 +331,12 @@ def calculate_group_scores(feat_df: pd.DataFrame) -> dict:
     scores["momentum"] = round((sum(momentum_conditions) / len(momentum_conditions)) * 30, 2)
 
     # 3. مجموعة السيولة (وزن 25)
-    volume_conditions = [
-        curr["volume"] > 1.5 * curr["vol_ma20"],
-        curr["obv"] > prev["obv"],
-        curr["volume"] > prev["volume"]
-    ]
-    scores["volume"] = round((sum(volume_conditions) / len(volume_conditions)) * 25, 2)
-
+    # داخل مجموعة السيولة
+volume_conditions = [
+    curr["volume"] > 1.2 * curr["vol_ma20"],  # تم التعديل
+    curr["obv"] > prev["obv"],
+    curr["volume"] > prev["volume"]
+]
     # 4. مجموعة الأنماط (وزن 15)
     scores["pattern"] = get_candle_pattern_score(feat_df)
 
