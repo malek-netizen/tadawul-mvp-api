@@ -7,7 +7,7 @@ import time
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-app = FastAPI(title="Tadawul Sniper Pro", version="2.6.0-Compatibility-Mode")
+app = FastAPI(title="Tadawul Sniper Pro", version="2.7.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,14 +22,10 @@ TOP10_WORKERS = 10
 _prices_cache = {}
 CACHE_TTL_SEC = 600
 
-# =========================
-# 1) جلب البيانات (كما هي)
-# =========================
 def fetch_yahoo_prices(ticker: str, range_="1y", interval="1d"):
     key = (ticker, range_, interval)
     if key in _prices_cache and time.time() - _prices_cache[key]["ts"] < CACHE_TTL_SEC:
         return _prices_cache[key]["df"]
-
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
@@ -60,43 +56,6 @@ def build_features(df: pd.DataFrame):
     d["vol_ma20"] = d["volume"].rolling(20).mean()
     return d.dropna().reset_index(drop=True)
 
-# =========================
-# 2) منطق الماكد والفلترة
-# =========================
-def passes_rules(feat_df: pd.DataFrame):
-    reasons = []
-    curr = feat_df.iloc[-1]
-    prev = feat_df.iloc[-2]
-    
-    if not (curr['volume'] > (curr['vol_ma20'] * 1.2)):
-        reasons.append("Weak Volume")
-
-    # منطق الماكد المطور
-    cond_macd_cross = (curr['macd'] > curr['macd_signal'])
-    cond_from_bottom = curr['macd'] < 0.001 
-    momentum_growing = (curr['macd'] - curr['macd_signal']) > (prev['macd'] - prev['macd_signal'])
-    
-    if not (cond_macd_cross and (cond_from_bottom or momentum_growing)):
-        reasons.append("MACD Reversal Missing")
-
-    if not (curr['close'] > curr['bb_mid']):
-        reasons.append("Below Mid-BB")
-
-    if curr['rsi14'] > 65: reasons.append("RSI High")
-    return (len(reasons) == 0), reasons
-
-def calculate_confidence(feat_df: pd.DataFrame):
-    curr = feat_df.iloc[-1]
-    score = 0
-    if curr['volume'] > curr['vol_ma20'] * 1.5: score += 40
-    if (curr['macd'] > curr['macd_signal']): score += 30
-    if (curr['close'] > curr['bb_mid']): score += 30
-    if curr['rsi14'] > 65: score -= 40
-    return max(0, min(100, score))
-
-# =========================
-# 3) المحلل والترتيب المتوافق مع الواجهة
-# =========================
 def analyze_one(ticker: str):
     t = ticker.strip().upper()
     if not t.endswith(".SR"): t += ".SR"
@@ -105,23 +64,46 @@ def analyze_one(ticker: str):
     
     feat_df = build_features(df)
     curr = feat_df.iloc[-1]
+    prev = feat_df.iloc[-2]
     last_close = float(curr["close"])
     
-    ok, reasons = passes_rules(feat_df)
-    conf = calculate_confidence(feat_df)
+    # --- منطق الفلترة (الماكد المطور) ---
+    reasons = []
+    if not (curr['volume'] > (curr['vol_ma20'] * 1.2)): reasons.append("ضعف سيولة")
     
-    # حساب الوقف
+    # الماكد: تقاطع صاعد + (تحت الصفر أو اتساع الفجوة الإيجابية)
+    cond_macd_cross = (curr['macd'] > curr['macd_signal'])
+    cond_from_bottom = curr['macd'] < 0.005 
+    momentum_growing = (curr['macd'] - curr['macd_signal']) > (prev['macd'] - prev['macd_signal'])
+    
+    if not (cond_macd_cross and (cond_from_bottom or momentum_growing)):
+        reasons.append("الماكد لم يستدر")
+
+    if not (curr['close'] > curr['bb_mid']): reasons.append("تحت منتصف البولينجر")
+    if curr['rsi14'] > 65: reasons.append("تضخم RSI")
+
+    ok = (len(reasons) == 0)
+    
+    # حساب الثقة
+    score = 0
+    if curr['volume'] > curr['vol_ma20'] * 1.5: score += 40
+    if cond_macd_cross: score += 30
+    if curr['close'] > curr['bb_mid']: score += 30
+    if curr['rsi14'] > 65: score -= 40
+    conf = max(0, min(100, score))
+
+    # الوقف الفني
     recent_low = float(feat_df['low'].tail(3).min())
-    stop_l = round(recent_low * 0.99, 2)
+    stop_l = round(recent_low * 0.997, 2)
 
     return {
         "ticker": t,
         "recommendation": "BUY" if ok else "NO_TRADE",
-        "confidence_pct": conf,
+        "confidence": conf,
         "entry": round(last_close, 2),
-        "take_profit": round(last_close * (1 + TP_PCT), 2),
-        "stop_loss": stop_l,
-        "reason": " | ".join(reasons) if reasons else "سيولة + استدارة ماكد",
+        "tp": round(last_close * (1 + TP_PCT), 2),
+        "sl": stop_l,
+        "reason": " | ".join(reasons) if reasons else "نموذج انفجاري: سيولة + ماكد مستد",
         "last_close": round(last_close, 2),
         "status": "APPROVED" if ok else "REJECTED"
     }
@@ -139,24 +121,26 @@ def top10():
             res = fut.result()
             if res: results.append(res)
     
-    # الترتيب الصحيح: الـ APPROVED أولاً ثم النسبة الأعلى
-    results.sort(key=lambda x: (x['status'] == 'APPROVED', x['confidence_pct']), reverse=True)
+    # الترتيب الرقمي القوي لضمان عدم الانعكاس
+    def get_weight(item):
+        return (1000 if item['status'] == 'APPROVED' else 0) + item['confidence']
+
+    results.sort(key=get_weight, reverse=True)
     
-    final_list = []
-    for r in results[:10]:
-        # إعادة صياغة البيانات لتطابق مسميات الواجهة القديمة (app.js)
-        final_list.append({
-            "ticker": r["ticker"],
-            "recommendation": r["recommendation"],
-            "confidence": r["confidence_pct"], # تأكد إذا كانت الواجهة تستخدم confidence أو conf_pct
-            "conf_pct": r["confidence_pct"],   # زيادة أمان للمسمى الآخر
-            "entry": r["entry"],
-            "tp": r["take_profit"],            # أغلب الواجهات القديمة تستخدم tp
-            "sl": r["stop_loss"],              # أغلب الواجهات القديمة تستخدم sl
-            "stop": r["stop_loss"],            # زيادة أمان للمسمى الآخر
-            "reason": r["reason"],
-            "last_close": r["last_close"],
-            "status": r["status"]
-        })
+    top_items = results[:10]
     
-    return final_list # مصفوفة مباشرة كما يحبها app.js
+    # إضافة إحصائية السوق في أول سهم (ليظهر في الواجهة القديمة)
+    if top_items:
+        scanned = len(results)
+        found = len([r for r in results if r['status'] == 'APPROVED'])
+        top_items[0]['reason'] = f"🔍 [تحليل {scanned} سهم | وجدنا {found}] - " + top_items[0]['reason']
+
+    return top_items
+
+@app.get("/predict")
+def predict(ticker: str):
+    return analyze_one(ticker)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
