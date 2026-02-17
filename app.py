@@ -38,7 +38,7 @@ _prices_cache = {}
 app = FastAPI(
     title="Tadawul Sniper Pro",
     description="محلل فني لأسهم السوق السعودي",
-    version="4.0.2"
+    version="4.0.3"
 )
 
 app.add_middleware(
@@ -291,14 +291,11 @@ def passes_core_rules(feat_df: pd.DataFrame) -> tuple[bool, list[str]]:
         reasons.append("السعر تحت SMA50")
     if not (curr["macd"] > curr["macd_signal"]):
         reasons.append("MACD أقل من Signal")
-    # تغيير النسبة من 1.5 إلى 1.2
     if not (curr["volume"] > 1.2 * curr["vol_ma20"]):
         reasons.append("حجم التداول أقل من 1.2x المتوسط")
-    # توسيع نطاق RSI
     if not (30 < curr["rsi14"] < 75):
         reasons.append(f"RSI خارج النطاق ({curr['rsi14']:.1f})")
     dist = (curr["close"] - curr["ema20"]) / curr["ema20"]
-    # رفع الحد المسموح به إلى 7%
     if dist > 0.07:
         reasons.append("السعر بعيد جداً عن المتوسط (>7%)")
     passed = len(reasons) == 0
@@ -331,12 +328,13 @@ def calculate_group_scores(feat_df: pd.DataFrame) -> dict:
     scores["momentum"] = round((sum(momentum_conditions) / len(momentum_conditions)) * 30, 2)
 
     # 3. مجموعة السيولة (وزن 25)
-    # داخل مجموعة السيولة
-volume_conditions = [
-    curr["volume"] > 1.2 * curr["vol_ma20"],  # تم التعديل
-    curr["obv"] > prev["obv"],
-    curr["volume"] > prev["volume"]
-]
+    volume_conditions = [
+        curr["volume"] > 1.2 * curr["vol_ma20"],  # تم التعديل
+        curr["obv"] > prev["obv"],
+        curr["volume"] > prev["volume"]
+    ]
+    scores["volume"] = round((sum(volume_conditions) / len(volume_conditions)) * 25, 2)
+
     # 4. مجموعة الأنماط (وزن 15)
     scores["pattern"] = get_candle_pattern_score(feat_df)
 
