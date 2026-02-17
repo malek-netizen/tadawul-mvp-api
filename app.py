@@ -139,24 +139,24 @@ def top10():
             res = fut.result()
             if res: results.append(res)
     
-    # الترتيب: APPROVED أولاً ثم النسبة الأعلى (reverse=True يعني من 100 إلى 0)
-    # ملاحظة: بايثون سيرتب APPROVED (True=1) قبل REJECTED (False=0)
+    # الترتيب الصحيح: الـ APPROVED أولاً ثم النسبة الأعلى
     results.sort(key=lambda x: (x['status'] == 'APPROVED', x['confidence_pct']), reverse=True)
     
-    top_10 = results[:10]
-
-    # لإظهار عدد الأسهم المحللة "خدعة" داخل أول عنصر ليظهر في الواجهة
-    if top_10:
-        total_scanned = len(results)
-        buy_signals = len([r for r in results if r['status'] == 'APPROVED'])
-        top_10[0]['reason'] = f"📊 [تم تحليل {total_scanned} سهم | وجدنا {buy_signals}] - " + top_10[0]['reason']
-
-    return top_10 # نعيد مصفوفة مباشرة كما تتوقع الواجهة القديمة
-
-@app.get("/predict")
-def predict(ticker: str):
-    return analyze_one(ticker)
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    final_list = []
+    for r in results[:10]:
+        # إعادة صياغة البيانات لتطابق مسميات الواجهة القديمة (app.js)
+        final_list.append({
+            "ticker": r["ticker"],
+            "recommendation": r["recommendation"],
+            "confidence": r["confidence_pct"], # تأكد إذا كانت الواجهة تستخدم confidence أو conf_pct
+            "conf_pct": r["confidence_pct"],   # زيادة أمان للمسمى الآخر
+            "entry": r["entry"],
+            "tp": r["take_profit"],            # أغلب الواجهات القديمة تستخدم tp
+            "sl": r["stop_loss"],              # أغلب الواجهات القديمة تستخدم sl
+            "stop": r["stop_loss"],            # زيادة أمان للمسمى الآخر
+            "reason": r["reason"],
+            "last_close": r["last_close"],
+            "status": r["status"]
+        })
+    
+    return final_list # مصفوفة مباشرة كما يحبها app.js
