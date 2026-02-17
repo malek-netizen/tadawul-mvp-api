@@ -8,7 +8,7 @@ import joblib
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-app = FastAPI(title="Tadawul Sniper Pro", version="2.3.0-Technical-Stop")
+app = FastAPI(title="Tadawul Sniper Pro", version="2.3.1-Final")
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,9 +20,7 @@ app.add_middleware(
 MODEL_PATH = "model.joblib"
 TICKERS_PATH = "tickers_sa.txt"
 
-# إعدادات الأهداف
 TP_PCT = 0.05
-# ملاحظة: تم استبدال SL_PCT الثابت بوقف فني متحرك داخل الدالة
 TOP10_WORKERS = 10     
 
 model = None
@@ -43,7 +41,6 @@ def fetch_yahoo_prices(ticker: str, range_="1y", interval="1d"):
         r = requests.get(url, params={"range": range_, "interval": interval}, headers=headers, timeout=15)
         js = r.json()
         quote = js['chart']['result'][0]['indicators']['quote'][0]
-        # إضافة High و Low لحساب الوقف الفني
         df = pd.DataFrame({
             "close": quote["close"],
             "high": quote["high"],
@@ -78,32 +75,27 @@ def build_features(df: pd.DataFrame):
     return d.dropna().reset_index(drop=True)
 
 # =========================
-# 2) منطق القواعد المطور (Rules)
+# 2) منطق القواعد والخصم
 # =========================
 def passes_rules(feat_df: pd.DataFrame):
     reasons = []
     curr = feat_df.iloc[-1]
     prev = feat_df.iloc[-2]
     
-    # 1. شرط السيولة الانفجارية (أهم شرط لأسهم النسب)
     if not (curr['volume'] > (curr['vol_ma20'] * 1.2)):
         reasons.append("Rejected: Weak Volume (No real surge)")
 
-    # 2. الماكد: استدارة من قاع
     if not (curr['macd'] > curr['macd_signal'] and curr['macd'] < 0.2):
         reasons.append("Rejected: MACD not turning from base")
 
-    # 3. البولينجر: اختراق المنتصف
     cond_bb_break = (curr['close'] > curr['bb_mid']) and (prev['close'] <= prev['bb_mid'])
     was_below = (feat_df['close'].shift(1).tail(5) < feat_df['bb_mid'].shift(1).tail(5)).any()
     if not (cond_bb_break or (curr['close'] > curr['bb_mid'] and was_below)):
         reasons.append("Rejected: No Mid-BB breakout")
 
-    # 4. RSI الأمان (تجنب القمم)
     if curr['rsi14'] > 65:
         reasons.append(f"Rejected: RSI too high ({round(curr['rsi14'],1)})")
 
-    # 5. الأمان من المطاردة (الابتعاد عن المتوسط)
     dist = (curr['close'] - curr['ema20']) / curr['ema20']
     if dist > 0.03:
         reasons.append("Rejected: Price too far from EMA20")
@@ -114,28 +106,20 @@ def calculate_confidence(feat_df: pd.DataFrame):
     curr = feat_df.iloc[-1]
     score = 0
     
-    # --- [1] نقاط القوة (السيولة والزخم) ---
     if curr['volume'] > curr['vol_ma20'] * 1.5: score += 40
     elif curr['volume'] > curr['vol_ma20'] * 1.2: score += 25
     
     if (curr['macd'] > curr['macd_signal']): score += 30
     if (curr['close'] > curr['bb_mid']): score += 30
     
-    # --- [2] نقاط الخصم (الأمان والتشبع) ---
-    # إذا كان السهم متضخم (RSI > 65)، نخصم 40 نقطة
-    if curr['rsi14'] > 65:
-        score -= 40
-        
-    # إذا كان السعر بعيد جداً عن المتوسط (EMA20)، نخصم 50 نقطة
+    if curr['rsi14'] > 65: score -= 40
     dist = (curr['close'] - curr['ema20']) / curr['ema20']
-    if dist > 0.03:
-        score -= 50
+    if dist > 0.03: score -= 50
 
-    # نضمن أن النسبة لا تخرج عن نطاق 0-100
     return max(0, min(100, score))
 
 # =========================
-# 3) المحلل مع الوقف الفني
+# 3) المحلل الرئيسي
 # =========================
 def analyze_one(ticker: str):
     t = ticker.strip().upper()
@@ -148,11 +132,9 @@ def analyze_one(ticker: str):
     curr = feat_df.iloc[-1]
     last_close = float(curr["close"])
     
-    # حساب الوقف الفني: أدنى سعر في آخر 3 شموع
     recent_low = float(feat_df['low'].tail(3).min())
-    technical_stop = round(recent_low * 0.997, 2) # وقف تحت القاع بـ 0.3%
+    technical_stop = round(recent_low * 0.997, 2)
     
-    # فلتر أمان للوقف (بين 1.5% و 4%)
     dist_pct = (last_close - technical_stop) / last_close
     if dist_pct > 0.04: technical_stop = round(last_close * 0.96, 2)
     if dist_pct < 0.015: technical_stop = round(last_close * 0.985, 2)
@@ -160,11 +142,9 @@ def analyze_one(ticker: str):
     ok, reasons = passes_rules(feat_df)
     conf_pct = calculate_confidence(feat_df)
     
-    recommendation = "BUY" if ok else "NO_TRADE"
-    
     return {
         "ticker": t,
-        "recommendation": recommendation,
+        "recommendation": "BUY" if ok else "NO_TRADE",
         "confidence_pct": conf_pct,
         "entry": round(last_close, 2),
         "take_profit": round(last_close * (1 + TP_PCT), 2),
@@ -188,11 +168,21 @@ def predict(ticker: str):
 
 @app.get("/top10")
 def top10():
-    # ... (كود جلب التيكرز والتحليل يبقى كما هو) ...
-
-    # التعديل هنا: 
-    # x['status'] == 'APPROVED' يضع الـ BUY في الأعلى
-    # x['confidence_pct'] يضمن ترتيبهم من 100 إلى 0
+    if not os.path.exists(TICKERS_PATH): 
+        return {"error": "Tickers file not found"}
+    
+    with open(TICKERS_PATH, "r") as f:
+        tickers = [line.strip() for line in f if line.strip()]
+    
+    results = []
+    # هنا تم إصلاح دالة التجميع والترتيب
+    with ThreadPoolExecutor(max_workers=TOP10_WORKERS) as executor:
+        futures = {executor.submit(analyze_one, t): t for t in tickers}
+        for fut in as_completed(futures):
+            res = fut.result()
+            if res: results.append(res)
+    
+    # الترتيب: APPROVED أولاً، ثم حسب النسبة من الأعلى للأقل
     sorted_res = sorted(
         results, 
         key=lambda x: (x['status'] == 'APPROVED', x['confidence_pct']), 
@@ -200,3 +190,7 @@ def top10():
     )
     
     return {"items": sorted_res[:10], "total_scanned": len(results)}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
