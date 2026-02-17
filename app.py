@@ -4,11 +4,10 @@ import requests
 import pandas as pd
 import numpy as np
 import time
-import joblib
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-app = FastAPI(title="Tadawul Sniper Pro", version="2.3.1-Final")
+app = FastAPI(title="Tadawul Sniper Pro", version="2.5.0-Final-Optimized")
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,13 +16,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MODEL_PATH = "model.joblib"
 TICKERS_PATH = "tickers_sa.txt"
-
 TP_PCT = 0.05
 TOP10_WORKERS = 10     
-
-model = None
 _prices_cache = {}
 CACHE_TTL_SEC = 600
 
@@ -46,8 +41,7 @@ def fetch_yahoo_prices(ticker: str, range_="1y", interval="1d"):
             "high": quote["high"],
             "low": quote["low"],
             "volume": quote["volume"]
-        })
-        df = df.dropna(subset=["close"]).reset_index(drop=True)
+        }).dropna(subset=["close"]).reset_index(drop=True)
         _prices_cache[key] = {"ts": time.time(), "df": df}
         return df
     except: return None
@@ -63,7 +57,6 @@ def build_features(df: pd.DataFrame):
     d["macd"] = ema12 - ema26
     d["macd_signal"] = d["macd"].ewm(span=9, adjust=False).mean()
     
-    std20 = close.rolling(20).std()
     d["bb_mid"] = d["sma20"]
     
     delta = close.diff()
@@ -75,47 +68,48 @@ def build_features(df: pd.DataFrame):
     return d.dropna().reset_index(drop=True)
 
 # =========================
-# 2) منطق القواعد والخصم
+# 2) القواعد ونظام الثقة
 # =========================
 def passes_rules(feat_df: pd.DataFrame):
     reasons = []
     curr = feat_df.iloc[-1]
     prev = feat_df.iloc[-2]
     
+    # سيولة انفجارية
     if not (curr['volume'] > (curr['vol_ma20'] * 1.2)):
-        reasons.append("Rejected: Weak Volume (No real surge)")
+        reasons.append("Weak Volume")
 
-    if not (curr['macd'] > curr['macd_signal'] and curr['macd'] < 0.2):
-        reasons.append("Rejected: MACD not turning from base")
+    # [MACD المطور]: تقاطع صاعد + (تحت الصفر أو زخم متزايد)
+    cond_macd_cross = (curr['macd'] > curr['macd_signal'])
+    cond_from_bottom = curr['macd'] < 0.001 
+    momentum_growing = (curr['macd'] - curr['macd_signal']) > (prev['macd'] - prev['macd_signal'])
+    
+    if not (cond_macd_cross and (cond_from_bottom or momentum_growing)):
+        reasons.append("MACD not in reversal phase")
 
+    # اختراق بولينجر
     cond_bb_break = (curr['close'] > curr['bb_mid']) and (prev['close'] <= prev['bb_mid'])
     was_below = (feat_df['close'].shift(1).tail(5) < feat_df['bb_mid'].shift(1).tail(5)).any()
     if not (cond_bb_break or (curr['close'] > curr['bb_mid'] and was_below)):
-        reasons.append("Rejected: No Mid-BB breakout")
+        reasons.append("No Mid-BB breakout")
 
-    if curr['rsi14'] > 65:
-        reasons.append(f"Rejected: RSI too high ({round(curr['rsi14'],1)})")
-
-    dist = (curr['close'] - curr['ema20']) / curr['ema20']
-    if dist > 0.03:
-        reasons.append("Rejected: Price too far from EMA20")
+    # أمان RSI و EMA
+    if curr['rsi14'] > 65: reasons.append(f"RSI high ({round(curr['rsi14'],1)})")
+    if ((curr['close'] - curr['ema20']) / curr['ema20']) > 0.03: reasons.append("Overextended price")
 
     return (len(reasons) == 0), reasons
 
 def calculate_confidence(feat_df: pd.DataFrame):
     curr = feat_df.iloc[-1]
     score = 0
-    
     if curr['volume'] > curr['vol_ma20'] * 1.5: score += 40
     elif curr['volume'] > curr['vol_ma20'] * 1.2: score += 25
-    
     if (curr['macd'] > curr['macd_signal']): score += 30
     if (curr['close'] > curr['bb_mid']): score += 30
     
+    # الخصم (Penalty) للأمان
     if curr['rsi14'] > 65: score -= 40
-    dist = (curr['close'] - curr['ema20']) / curr['ema20']
-    if dist > 0.03: score -= 50
-
+    if ((curr['close'] - curr['ema20']) / curr['ema20']) > 0.03: score -= 50
     return max(0, min(100, score))
 
 # =========================
@@ -124,7 +118,6 @@ def calculate_confidence(feat_df: pd.DataFrame):
 def analyze_one(ticker: str):
     t = ticker.strip().upper()
     if not t.endswith(".SR"): t += ".SR"
-    
     df = fetch_yahoo_prices(t)
     if df is None or len(df) < 30: return None
     
@@ -132,24 +125,24 @@ def analyze_one(ticker: str):
     curr = feat_df.iloc[-1]
     last_close = float(curr["close"])
     
+    # الوقف الفني: أدنى سعر في آخر 3 شموع
     recent_low = float(feat_df['low'].tail(3).min())
-    technical_stop = round(recent_low * 0.997, 2)
-    
-    dist_pct = (last_close - technical_stop) / last_close
-    if dist_pct > 0.04: technical_stop = round(last_close * 0.96, 2)
-    if dist_pct < 0.015: technical_stop = round(last_close * 0.985, 2)
+    stop_l = round(recent_low * 0.997, 2)
+    dist = (last_close - stop_l) / last_close
+    if dist > 0.04: stop_l = round(last_close * 0.96, 2)
+    elif dist < 0.015: stop_l = round(last_close * 0.985, 2)
     
     ok, reasons = passes_rules(feat_df)
-    conf_pct = calculate_confidence(feat_df)
+    conf = calculate_confidence(feat_df)
     
     return {
         "ticker": t,
         "recommendation": "BUY" if ok else "NO_TRADE",
-        "confidence_pct": conf_pct,
+        "confidence_pct": conf,
         "entry": round(last_close, 2),
         "take_profit": round(last_close * (1 + TP_PCT), 2),
-        "stop_loss": technical_stop,
-        "reason": " | ".join(reasons) if reasons else "اختراق قاع بسيولة انفجارية (نموذج النسب)",
+        "stop_loss": stop_l,
+        "reason": " | ".join(reasons) if reasons else "اختراق قاع بسيولة انفجارية",
         "last_close": round(last_close, 2),
         "status": "APPROVED" if ok else "REJECTED"
     }
@@ -157,39 +150,39 @@ def analyze_one(ticker: str):
 # =========================
 # 4) الروابط (Endpoints)
 # =========================
-@app.on_event("startup")
-def startup():
-    global model
-    if os.path.exists(MODEL_PATH): model = joblib.load(MODEL_PATH)
-
-@app.get("/predict")
-def predict(ticker: str):
-    return analyze_one(ticker)
-
 @app.get("/top10")
 def top10():
-    if not os.path.exists(TICKERS_PATH): 
-        return {"error": "Tickers file not found"}
-    
+    if not os.path.exists(TICKERS_PATH): return {"error": "tickers_sa.txt not found"}
     with open(TICKERS_PATH, "r") as f:
         tickers = [line.strip() for line in f if line.strip()]
     
     results = []
-    # هنا تم إصلاح دالة التجميع والترتيب
     with ThreadPoolExecutor(max_workers=TOP10_WORKERS) as executor:
-        futures = {executor.submit(analyze_one, t): t for t in tickers}
+        futures = [executor.submit(analyze_one, t) for t in tickers]
         for fut in as_completed(futures):
             res = fut.result()
             if res: results.append(res)
     
-    # الترتيب: APPROVED أولاً، ثم حسب النسبة من الأعلى للأقل
-    sorted_res = sorted(
-        results, 
-        key=lambda x: (x['status'] == 'APPROVED', x['confidence_pct']), 
-        reverse=True
-    )
+    # دالة الترتيب لضمان عدم الانعكاس: APPROVED تأخذ وزن 1000
+    def final_sorter(item):
+        status_weight = 1000 if item['status'] == 'APPROVED' else 0
+        return status_weight + item['confidence_pct']
+
+    sorted_res = sorted(results, key=final_sorter, reverse=True)
+    buy_signals = [r for r in results if r['status'] == 'APPROVED']
     
-    return {"items": sorted_res[:10], "total_scanned": len(results)}
+    return {
+        "market_summary": {
+            "total_scanned": len(results),
+            "buy_signals_found": len(buy_signals),
+            "market_health": "Bullish" if len(buy_signals) > 5 else "Cautious"
+        },
+        "items": sorted_res[:10]
+    }
+
+@app.get("/predict")
+def predict(ticker: str):
+    return analyze_one(ticker)
 
 if __name__ == "__main__":
     import uvicorn
