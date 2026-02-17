@@ -310,11 +310,16 @@ def calculate_group_scores(feat_df: pd.DataFrame) -> dict:
     scores = {}
 
     # 1. مجموعة الاتجاه (وزن 20)
+    # شرط القمم والقيعان الصاعدة: آخر 5 قمم متزايدة وآخر 5 قيعان متزايدة
+    highs_5 = feat_df["high"].iloc[-5:].values
+    lows_5 = feat_df["low"].iloc[-5:].values
+    trend_hh = all(highs_5[i] > highs_5[i-1] for i in range(1, len(highs_5)))
+    trend_hl = all(lows_5[i] > lows_5[i-1] for i in range(1, len(lows_5)))
+    
     trend_conditions = [
         curr["close"] > curr["ema20"],
         curr["close"] > curr["sma50"],
-        (feat_df["high"].iloc[-5:] > feat_df["high"].iloc[-6:-1].shift()).all() and \
-        (feat_df["low"].iloc[-5:] > feat_df["low"].iloc[-6:-1].shift()).all()
+        trend_hh and trend_hl
     ]
     scores["trend"] = round((sum(trend_conditions) / len(trend_conditions)) * 20, 2)
 
@@ -329,7 +334,7 @@ def calculate_group_scores(feat_df: pd.DataFrame) -> dict:
 
     # 3. مجموعة السيولة (وزن 25)
     volume_conditions = [
-        curr["volume"] > 1.2 * curr["vol_ma20"],  # تم التعديل
+        curr["volume"] > 1.2 * curr["vol_ma20"],
         curr["obv"] > prev["obv"],
         curr["volume"] > prev["volume"]
     ]
@@ -360,7 +365,7 @@ def calculate_group_scores(feat_df: pd.DataFrame) -> dict:
 
     scores["total"] = round(scores["trend"] + scores["momentum"] + scores["volume"] + scores["pattern"] + scores["levels"], 2)
     return scores
-
+    
 # ======================== دالة التحليل الرئيسية ========================
 def analyze_one(ticker: str) -> Optional[Dict[str, Any]]:
     t = ticker.strip().upper()
