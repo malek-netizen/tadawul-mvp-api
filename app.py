@@ -1,196 +1,83 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-import requests
 import pandas as pd
 import numpy as np
-import time
-import joblib
-import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-app = FastAPI(title="Tadawul Sniper Pro", version="2.2.1-Integrated")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-MODEL_PATH = "model.joblib"
-TICKERS_PATH = "tickers_sa.txt"
-
-# إعدادات الأهداف والأمان (ضبط القاع)
-TP_PCT = 0.05
-SL_PCT = 0.02
-RSI_SAFE_MAX = 60      # سقف الأمان (يمنع تضخم الأهلي)
-EMA_STRETCH_MAX = 0.03 # أقصى ابتعاد عن المتوسط 3%
-TOP10_WORKERS = 10     # سرعة التحليل
-
-model = None
-_prices_cache = {}
-CACHE_TTL_SEC = 600
-
-# =========================
-# 1) جلب البيانات والمؤشرات
-# =========================
-def fetch_yahoo_prices(ticker: str, range_="1y", interval="1d"):
-    key = (ticker, range_, interval)
-    if key in _prices_cache and time.time() - _prices_cache[key]["ts"] < CACHE_TTL_SEC:
-        return _prices_cache[key]["df"]
-
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        r = requests.get(url, params={"range": range_, "interval": interval}, headers=headers, timeout=15)
-        js = r.json()
-        quote = js['chart']['result'][0]['indicators']['quote'][0]
-        df = pd.DataFrame(quote)
-        df = df.dropna(subset=["close"]).reset_index(drop=True)
-        _prices_cache[key] = {"ts": time.time(), "df": df}
-        return df
-    except: return None
-
-def build_features(df: pd.DataFrame):
-    d = df.copy()
-    close = d["close"]
-    # المتوسطات
-    d["ema20"] = close.ewm(span=20, adjust=False).mean()
-    d["sma20"] = close.rolling(20).mean()
-    # الماكد
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    d["macd"] = ema12 - ema26
-    d["macd_signal"] = d["macd"].ewm(span=9, adjust=False).mean()
-    # البولينجر
-    std20 = close.rolling(20).std()
-    d["bb_mid"] = d["sma20"]
-    d["bb_upper"] = d["sma20"] + (std20 * 2)
-    # RSI
-    delta = close.diff()
-    gain = delta.where(delta > 0, 0).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    d["rsi14"] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
-    # السيولة
-    d["vol_ma20"] = d["volume"].rolling(20).mean()
-    return d.dropna().reset_index(drop=True)
-
-# =========================
-# 2) منطق "قناص القيعان" (Core Logic)
-# =========================
+# ==========================================
+# 1. منطق "قناص القيعان" المعدل (The Core)
+# ==========================================
 def passes_rules(feat_df: pd.DataFrame):
     reasons = []
     curr = feat_df.iloc[-1]
     prev = feat_df.iloc[-2]
     
-    # 1. الماكد: استدارة من منطقة منخفضة (شرط ساسكو)
-    cond_macd_bottom = (curr['macd'] > curr['macd_signal']) and (prev['macd'] <= prev['macd_signal']) and (curr['macd'] < 0.15)
-    if not cond_macd_bottom:
-        # سماح بسيط لو الزخم لسه في بدايته وقريب من الصفر
-        if not (curr['macd'] > curr['macd_signal'] and curr['macd'] < 0.2 and (curr['macd']-curr['macd_signal'] > prev['macd']-prev['macd_signal'])):
-            reasons.append("Rejected: MACD not turning from base.")
+    # [تعديل 1]: شرط السيولة الانفجارية (محرك أسهم النسب)
+    # يجب أن يكون حجم تداول الساعة الحالية أعلى من المتوسط بـ 20% على الأقل
+    cond_vol_surge = curr['volume'] > (curr['vol_ma20'] * 1.2)
+    if not cond_vol_surge:
+        reasons.append("Rejected: Weak Volume (No real surge)")
 
-    # 2. البولينجر: اختراق المنتصف (Pivot point)
+    # [تعديل 2]: اختراق منتصف البولينجر (نقطة التحول من خمول لارتفاع)
     cond_bb_break = (curr['close'] > curr['bb_mid']) and (prev['close'] <= prev['bb_mid'])
+    # التأكد أنه كان تحت المتوسط في آخر 5 ساعات (يعني جاي من قاع)
     was_below = (feat_df['close'].shift(1).tail(5) < feat_df['bb_mid'].shift(1).tail(5)).any()
     if not (cond_bb_break or (curr['close'] > curr['bb_mid'] and was_below)):
-        reasons.append("Rejected: No BB mid-band breakout.")
+        reasons.append("Rejected: No Mid-BB Breakout")
 
-    # 3. RSI الأمان: (يمنع تضخم الأهلي)
-    if curr['rsi14'] > RSI_SAFE_MAX:
-        reasons.append(f"Rejected: RSI too high ({round(curr['rsi14'],1)})")
-    if not (curr['rsi14'] > prev['rsi14']):
-        reasons.append("Rejected: RSI not rising.")
+    # [تعديل 3]: استدارة الماكد من تحت الصفر (بصمة ساسكو)
+    cond_macd_turn = (curr['macd'] > curr['macd_signal']) and (curr['macd'] < 0.2)
+    if not cond_macd_turn:
+        reasons.append("Rejected: MACD not turning from base")
 
-    # 4. استدارة المتوسط (MA Slope)
-    is_ma_turning = curr['sma20'] >= feat_df['sma20'].iloc[-4]
-    if not is_ma_turning:
-        reasons.append("Rejected: SMA20 slope is downward.")
-
-    # 5. الأمان من المطاردة
-    dist = (curr['close'] - curr['ema20']) / curr['ema20']
-    if dist > EMA_STRETCH_MAX:
-        reasons.append("Rejected: Price overextended from EMA20.")
+    # [تعديل 4]: سقف الأمان (تجنب القمم المتضخمة)
+    if curr['rsi14'] > 65:
+        reasons.append(f"Rejected: RSI Overextended ({round(curr['rsi14'],1)})")
+    
+    # [تعديل 5]: منع الانفجار السعري المبالغ فيه (المطاردة)
+    dist_from_ema = (curr['close'] - curr['ema20']) / curr['ema20']
+    if dist_from_ema > 0.03:
+        reasons.append("Rejected: Price too far from EMA20")
 
     return (len(reasons) == 0), reasons
 
-def calculate_confidence(feat_df: pd.DataFrame):
-    curr = feat_df.iloc[-1]
-    prev = feat_df.iloc[-2]
-    score = 0
-    if (curr['macd'] > curr['macd_signal']) and (curr['macd'] < 0.1): score += 35
-    if (curr['close'] > curr['bb_mid']): score += 25
-    if (curr['rsi14'] > prev['rsi14'] and curr['rsi14'] < 55): score += 20
-    if (curr['volume'] > curr['vol_ma20']): score += 20
-    return min(100, score)
-
-# =========================
-# 3) تحليل سهم واحد (The Analyzer)
-# =========================
+# ==========================================
+# 2. تحليل السهم وحساب الوقف الفني
+# ==========================================
 def analyze_one(ticker: str):
-    t = ticker.strip().upper()
-    if not t.endswith(".SR"): t += ".SR"
+    # (كود جلب البيانات وبناء الميزات feat_df يبقى كما هو)
     
-    df = fetch_yahoo_prices(t)
+    df = fetch_yahoo_prices(ticker)
     if df is None or len(df) < 30: return None
-    
     feat_df = build_features(df)
-    last_close = float(feat_df["close"].iloc[-1])
+    curr = feat_df.iloc[-1]
+    last_close = float(curr["close"])
     
-    ok, reasons = passes_rules(feat_df)
-    conf_pct = calculate_confidence(feat_df)
+    # [تعديل 6]: إيقاف الخسارة الفني (تحت أدنى سعر لآخر 3 شموع)
+    recent_low = float(feat_df['low'].tail(3).min())
+    technical_stop = round(recent_low * 0.997, 2) # هامش أمان بسيط (0.3%)
     
-    # دمج الـ ML إذا كان الملف موجوداً
-    ml_conf = None
-    if model:
-        try:
-            # هنا نفترض وجود موديل مدرب على نفس ميزات FEATURE_COLS
-            pass 
-        except: ml_conf = None
+    # حماية: الوقف لا يقل عن 1.5% ولا يزيد عن 4% من سعر الدخول
+    stop_dist_pct = (last_close - technical_stop) / last_close
+    if stop_dist_pct > 0.04: technical_stop = round(last_close * 0.96, 2)
+    if stop_dist_pct < 0.015: technical_stop = round(last_close * 0.985, 2)
 
+    ok, reasons = passes_rules(feat_df)
+    
+    # [تعديل 7]: حساب الثقة بوزن ثقيل للسيولة
+    score = 0
+    if curr['volume'] > curr['vol_ma20'] * 1.5: score += 40 # سيولة ضخمة
+    elif curr['volume'] > curr['vol_ma20'] * 1.2: score += 30 # سيولة جيدة
+    
+    if (curr['macd'] > curr['macd_signal']): score += 30
+    if (curr['close'] > curr['bb_mid']): score += 30
+    
     recommendation = "BUY" if ok else "NO_TRADE"
     
     return {
-        "ticker": t,
+        "ticker": ticker,
         "recommendation": recommendation,
-        "confidence_pct": conf_pct,
+        "confidence_pct": min(100, score),
         "entry": round(last_close, 2),
-        "take_profit": round(last_close * (1 + TP_PCT), 2),
-        "stop_loss": round(last_close * (1 - SL_PCT), 2),
-        "reason": " | ".join(reasons) if reasons else "قاع حقيقي + استدارة فنية",
-        "last_close": round(last_close, 2),
+        "take_profit": round(last_close * 1.05, 2), # الهدف الأول 5%
+        "stop_loss": technical_stop,
+        "reason": " | ".join(reasons) if reasons else "سيولة انفجارية + اختراق قاع (نموذج النسب)",
         "status": "APPROVED" if ok else "REJECTED"
     }
-
-# =========================
-# 4) الروابط (Endpoints)
-# =========================
-@app.on_event("startup")
-def startup():
-    global model
-    if os.path.exists(MODEL_PATH): model = joblib.load(MODEL_PATH)
-
-@app.get("/predict")
-def predict(ticker: str):
-    return analyze_one(ticker)
-
-@app.get("/top10")
-def top10():
-    if not os.path.exists(TICKERS_PATH): return {"error": "File not found"}
-    with open(TICKERS_PATH, "r") as f:
-        tickers = [line.strip() for line in f if line.strip()]
-    
-    results = []
-    with ThreadPoolExecutor(max_workers=TOP10_WORKERS) as executor:
-        futures = [executor.submit(analyze_one, t) for t in tickers]
-        for fut in as_completed(futures):
-            res = fut.result()
-            if res: results.append(res)
-    
-    # الترتيب: المقبول أولاً ثم حسب القوة
-    sorted_res = sorted(results, key=lambda x: (x['recommendation'] == 'BUY', x['confidence_pct']), reverse=True)
-    return {"items": sorted_res[:10], "total_scanned": len(results)}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
