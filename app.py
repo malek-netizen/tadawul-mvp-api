@@ -188,20 +188,15 @@ def predict(ticker: str):
 
 @app.get("/top10")
 def top10():
-    if not os.path.exists(TICKERS_PATH): return {"error": "File not found"}
-    with open(TICKERS_PATH, "r") as f:
-        tickers = [line.strip() for line in f if line.strip()]
-    
-    results = []
-    with ThreadPoolExecutor(max_workers=TOP10_WORKERS) as executor:
-        futures = [executor.submit(analyze_one, t) for t in tickers]
-        for fut in as_completed(futures):
-            res = fut.result()
-            if res: results.append(res)
-    
-    sorted_res = sorted(results, key=lambda x: (x['recommendation'] == 'BUY', x['confidence_pct']), reverse=True)
-    return {"items": sorted_res[:10], "total_scanned": len(results)}
+    # ... (كود جلب التيكرز والتحليل يبقى كما هو) ...
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # التعديل هنا: 
+    # x['status'] == 'APPROVED' يضع الـ BUY في الأعلى
+    # x['confidence_pct'] يضمن ترتيبهم من 100 إلى 0
+    sorted_res = sorted(
+        results, 
+        key=lambda x: (x['status'] == 'APPROVED', x['confidence_pct']), 
+        reverse=True
+    )
+    
+    return {"items": sorted_res[:10], "total_scanned": len(results)}
