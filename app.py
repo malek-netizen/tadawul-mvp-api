@@ -387,11 +387,12 @@ def analyze_one(ticker: str) -> Optional[Dict[str, Any]]:
         return {
             "ticker": t,
             "status": "EXCLUDED",
-            "reason": exclude_reason,
-            "confidence": 0,
+            "recommendation": "NO_TRADE",
+            "confidence": 0.0,
             "entry": round(feat_df.iloc[-1]["close"], 2),
-            "tp": 0,
-            "sl": 0,
+            "tp": 0.0,
+            "sl": 0.0,
+            "reason": exclude_reason,
             "lastClose": round(feat_df.iloc[-1]["close"], 2)
         }
 
@@ -400,16 +401,17 @@ def analyze_one(ticker: str) -> Optional[Dict[str, Any]]:
         return {
             "ticker": t,
             "status": "REJECTED",
-            "reason": " | ".join(core_reasons),
-            "confidence": 0,
+            "recommendation": "NO_TRADE",
+            "confidence": 0.0,
             "entry": round(feat_df.iloc[-1]["close"], 2),
-            "tp": 0,
-            "sl": 0,
+            "tp": 0.0,
+            "sl": 0.0,
+            "reason": " | ".join(core_reasons),
             "lastClose": round(feat_df.iloc[-1]["close"], 2)
         }
 
     scores = calculate_group_scores(feat_df)
-    confidence = scores["total"]
+    confidence = scores["total"] / 100.0  # تحويل إلى كسر عشري
 
     curr = feat_df.iloc[-1]
     entry = round(curr["close"], 2)
@@ -422,6 +424,7 @@ def analyze_one(ticker: str) -> Optional[Dict[str, Any]]:
     return {
         "ticker": t,
         "status": "APPROVED",
+        "recommendation": "BUY",
         "confidence": confidence,
         "entry": entry,
         "tp": tp,
@@ -430,6 +433,32 @@ def analyze_one(ticker: str) -> Optional[Dict[str, Any]]:
         "lastClose": entry
     }
 
+# ======================== دالة التحليل المبسطة للتشخيص ========================
+def analyze_one_debug(ticker: str):
+    """نسخة مبسطة من analyze_one لإرجاع الحالة والسبب فقط."""
+    t = ticker.strip().upper()
+    if not t.endswith(".SR"):
+        t += ".SR"
+
+    df = fetch_yahoo_prices(t)
+    if df is None:
+        return None
+
+    try:
+        feat_df = build_features(df)
+    except Exception:
+        return None
+
+    excluded, exclude_reason = should_exclude(feat_df)
+    if excluded:
+        return {"status": "EXCLUDED", "reason": exclude_reason, "recommendation": "NO_TRADE"}
+
+    passed, reasons = passes_core_rules(feat_df)
+    if not passed:
+        return {"status": "REJECTED", "reason": " | ".join(reasons), "recommendation": "NO_TRADE"}
+
+    return {"status": "APPROVED", "reason": "", "recommendation": "BUY"}
+    
 # ======================== Endpoints العامة ========================
 @app.get("/health")
 async def health_check():
