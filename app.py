@@ -1,9 +1,7 @@
-# main.py
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 import pandas as pd
-import pandas_ta as ta
 import numpy as np
 import time
 import os
@@ -53,10 +51,7 @@ app.add_middleware(
 
 # ======================== دوال جلب البيانات من Yahoo Finance ========================
 def fetch_yahoo_prices(ticker: str, range_: str = "1y", interval: str = "1d") -> Optional[pd.DataFrame]:
-    """
-    جلب بيانات السهم من Yahoo Finance مع تخزين مؤقت.
-    تعيد DataFrame يحتوي على open, high, low, close, volume أو None عند الفشل.
-    """
+    """جلب بيانات السهم من Yahoo Finance مع تخزين مؤقت."""
     key = (ticker, range_, interval)
     if key in cache:
         logger.info(f"استخدام البيانات المخزنة لـ {ticker}")
@@ -93,65 +88,84 @@ def fetch_yahoo_prices(ticker: str, range_: str = "1y", interval: str = "1d") ->
         logger.error(f"خطأ في جلب {ticker}: {str(e)}")
         return None
 
-# ======================== حساب المؤشرات الفنية باستخدام pandas_ta ========================
+# ======================== حساب المؤشرات الفنية يدويًا ========================
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    """إضافة المؤشرات الفنية إلى DataFrame."""
+    """إضافة المؤشرات الفنية إلى DataFrame باستخدام حسابات يدوية."""
     d = df.copy()
-    # استخدام مكتبة pandas_ta لحساب المؤشرات
-    d.ta.ema(length=20, append=True)          # EMA_20
-    d.ta.sma(length=20, append=True)          # SMA_20
-    d.ta.sma(length=50, append=True)          # SMA_50
-    d.ta.macd(append=True)                    # MACD_12_26_9, MACDh_12_26_9, MACDs_12_26_9
-    d.ta.rsi(length=14, append=True)          # RSI_14
-    d.ta.bbands(length=20, std=2, append=True) # BBL_20_2.0, BBM_20_2.0, BBU_20_2.0
-    d.ta.obv(append=True)                      # OBV
-    d.ta.stoch(append=True)                    # STOCHk_14_3_3, STOCHd_14_3_3
-    d.ta.atr(length=14, append=True)           # ATR_14
-    d.ta.adx(length=14, append=True)           # ADX_14
+    close = d["close"]
+    high = d["high"]
+    low = d["low"]
+    volume = d["volume"]
 
-    # إعادة تسمية الأعمدة لتكون قصيرة ومتسقة
-    rename_dict = {
-        "EMA_20": "ema20",
-        "SMA_20": "sma20",
-        "SMA_50": "sma50",
-        "RSI_14": "rsi14",
-        "BBM_20_2.0": "bb_mid",
-        "BBU_20_2.0": "bb_upper",
-        "ATR_14": "atr14",
-        "OBV": "obv",
-        "STOCHk_14_3_3": "stoch_k",
-        "STOCHd_14_3_3": "stoch_d",
-        "ADX_14": "adx"
-    }
-    d.rename(columns=rename_dict, inplace=True)
+    # EMA20
+    d["ema20"] = close.ewm(span=20, adjust=False).mean()
+    # SMA20 و SMA50
+    d["sma20"] = close.rolling(20).mean()
+    d["sma50"] = close.rolling(50).mean()
 
-    # أعمدة MACD
-    if "MACD_12_26_9" in d.columns:
-        d.rename(columns={"MACD_12_26_9": "macd"}, inplace=True)
-    if "MACDh_12_26_9" in d.columns:
-        d.rename(columns={"MACDh_12_26_9": "macd_hist"}, inplace=True)
-    if "MACDs_12_26_9" in d.columns:
-        d.rename(columns={"MACDs_12_26_9": "macd_signal"}, inplace=True)
+    # MACD
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    d["macd"] = ema12 - ema26
+    d["macd_signal"] = d["macd"].ewm(span=9, adjust=False).mean()
+    d["macd_hist"] = d["macd"] - d["macd_signal"]
 
-    # إضافة vol_ma20 و vol_std يدوياً
-    d["vol_ma20"] = d["volume"].rolling(20).mean()
-    d["vol_std"] = d["volume"].rolling(20).std()
-    d["atr_pct"] = d["atr14"] / d["close"] * 100
+    # RSI
+    delta = close.diff()
+    gain = delta.where(delta > 0, 0).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    d["rsi14"] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
 
-    # إضافة عمود لون الشمعة
-    d["candle_green"] = d["close"] > d["open"]
-    d["body"] = abs(d["close"] - d["open"])
-    d["upper_shadow"] = d["high"] - d[["close", "open"]].max(axis=1)
-    d["lower_shadow"] = d[["close", "open"]].min(axis=1) - d["low"]
+    # Bollinger Bands
+    d["bb_mid"] = d["sma20"]
+    d["bb_std"] = close.rolling(20).std()
+    d["bb_upper"] = d["bb_mid"] + 2 * d["bb_std"]
 
-    # حذف الصفوف الأولى التي تحتوي NaN
-    d.dropna(inplace=True)
-    d.reset_index(drop=True, inplace=True)
+    # OBV (حجم التداول التراكمي)
+    obv = [0]
+    for i in range(1, len(close)):
+        if close.iloc[i] > close.iloc[i-1]:
+            obv.append(obv[-1] + volume.iloc[i])
+        elif close.iloc[i] < close.iloc[i-1]:
+            obv.append(obv[-1] - volume.iloc[i])
+        else:
+            obv.append(obv[-1])
+    d["obv"] = obv
+
+    # Stochastic
+    low14 = low.rolling(14).min()
+    high14 = high.rolling(14).max()
+    d["stoch_k"] = 100 * ((close - low14) / (high14 - low14 + 1e-9))
+    d["stoch_d"] = d["stoch_k"].rolling(3).mean()
+
+    # ATR
+    tr1 = high - low
+    tr2 = abs(high - close.shift())
+    tr3 = abs(low - close.shift())
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    d["atr14"] = tr.rolling(14).mean()
+    d["atr_pct"] = d["atr14"] / close * 100
+
+    # ADX (تبسيط: نستخدم pandas_ta غير متوفر، نستخدم متوسط اتجاهي مبسط)
+    # يمكن تجاهل ADX أو استخدام حسابات يدوية معقدة، لكننا سنستبعده للتبسيط
+    d["adx"] = 25  # قيمة افتراضية لتجنب الأخطاء
+
+    # حجم التداول
+    d["vol_ma20"] = volume.rolling(20).mean()
+    d["vol_std"] = volume.rolling(20).std()
+
+    # خصائص الشمعة
+    d["candle_green"] = close > d["open"]
+    d["body"] = abs(close - d["open"])
+    d["upper_shadow"] = high - d[["close", "open"]].max(axis=1)
+    d["lower_shadow"] = d[["close", "open"]].min(axis=1) - low
+
+    # حذف الصفوف التي تحتوي NaN
+    d = d.dropna().reset_index(drop=True)
     return d
 
 # ======================== دوال الأنماط السعرية ========================
 def is_bullish_engulfing(prev: pd.Series, curr: pd.Series) -> bool:
-    """نمط ابتلاع شرائي: شمعة حمراء تتبعها شمعة خضراء تبتلعها بالكامل."""
     prev_red = prev["close"] < prev["open"]
     curr_green = curr["close"] > curr["open"]
     if not (prev_red and curr_green):
@@ -159,14 +173,12 @@ def is_bullish_engulfing(prev: pd.Series, curr: pd.Series) -> bool:
     return curr["open"] < prev["close"] and curr["close"] > prev["open"]
 
 def is_hammer(candle: pd.Series) -> bool:
-    """نمط مطرقة: ظل سفلي طويل (ضعف الجسم على الأقل) وظل علوي قصير."""
     body = candle["body"]
     lower = candle["lower_shadow"]
     upper = candle["upper_shadow"]
     return lower > 2 * body and upper < 0.3 * body
 
 def is_morning_star(c1: pd.Series, c2: pd.Series, c3: pd.Series) -> bool:
-    """نمط نجمة صباحية مبسطة: شمعة حمراء، شمعة صغيرة، شمعة خضراء تغلق فوق منتصف الأولى."""
     c1_red = c1["close"] < c1["open"]
     c3_green = c3["close"] > c3["open"]
     c2_small = c2["body"] < 0.1 * (c1["high"] - c1["low"])
@@ -176,7 +188,6 @@ def is_morning_star(c1: pd.Series, c2: pd.Series, c3: pd.Series) -> bool:
     return c3["close"] > midpoint
 
 def is_piercing(prev: pd.Series, curr: pd.Series) -> bool:
-    """نمط الاختراق الصاعد: شمعة حمراء تليها شمعة خضراء تغلق فوق منتصف الحمراء."""
     if not (prev["close"] < prev["open"] and curr["close"] > curr["open"]):
         return False
     midpoint = (prev["open"] + prev["close"]) / 2
@@ -191,24 +202,21 @@ def get_candle_pattern_score(feat_df: pd.DataFrame) -> int:
     prev2 = feat_df.iloc[-3]
 
     score = 0
-    # الأنماط الصاعدة القوية
     if is_bullish_engulfing(prev, last):
         score += 15
     elif is_morning_star(prev2, prev, last):
         score += 15
     elif is_piercing(prev, last):
         score += 12
-    elif is_hammer(last) and (prev["close"] < prev["open"]):  # مطرقة بعد هبوط
+    elif is_hammer(last) and (prev["close"] < prev["open"]):
         score += 12
     elif last["candle_green"]:
-        # شمعة خضراء عادية: نعطي نقاطاً حسب حجم الجسم
         body_pct = last["body"] / (last["high"] - last["low"]) if (last["high"]-last["low"])>0 else 0
         if body_pct > 0.5:
             score += 5
         else:
             score += 2
 
-    # خصم بسيط إذا كان هناك ظل علوي طويل
     if last["upper_shadow"] > 2 * last["body"]:
         score -= 3
 
@@ -344,13 +352,13 @@ def calculate_group_scores(feat_df: pd.DataFrame) -> dict:
 
     scores = {}
 
-    # 1. مجموعة الاتجاه (وزن 20) – 4 شروط
+    # 1. مجموعة الاتجاه (وزن 20) – 3 شروط (استبعدنا ADX لعدم الدقة)
     trend_conditions = [
         curr["close"] > curr["ema20"],
         curr["close"] > curr["sma50"],
-        curr["adx"] > 20 if "adx" in curr else False,
-        # شرط القمم والقيعان الصاعدة (HH/HL) خلال آخر 5 أيام (تبسيط)
-        (feat_df["high"].iloc[-5:].is_monotonic_increasing and feat_df["low"].iloc[-5:].is_monotonic_increasing)
+        # شرط القمم والقيعان الصاعدة خلال آخر 5 أيام (تبسيط)
+        (feat_df["high"].iloc[-5:] > feat_df["high"].iloc[-6:-1].shift()).all() and \
+        (feat_df["low"].iloc[-5:] > feat_df["low"].iloc[-6:-1].shift()).all()
     ]
     trend_score = (sum(trend_conditions) / len(trend_conditions)) * 20
     scores["trend"] = round(trend_score, 2)
@@ -379,8 +387,7 @@ def calculate_group_scores(feat_df: pd.DataFrame) -> dict:
     scores["pattern"] = pattern_score  # بالفعل من 0 إلى 15
 
     # 5. مجموعة المستويات (وزن 10) – 3 شروط (فيبوناتشي، فجوة، قرب من المتوسط)
-    # (فيبوناتشي سنبسطه: نعتبر أن السعر عند مستوى فيبوناتشي إذا كان ضمن 1% من قمة/قاع سابقة)
-    # حساب فيبوناتشي تقريبي: نأخذ آخر 60 يوم ونحسب مستويات 0.382 و 0.618
+    # فيبوناتشي تقريبي
     fib_score = 0
     if len(feat_df) > 60:
         recent_high = feat_df["high"].iloc[-60:].max()
@@ -393,7 +400,7 @@ def calculate_group_scores(feat_df: pd.DataFrame) -> dict:
                 break
     # فجوة صاعدة
     gap_up = 0
-    if "open" in curr and len(feat_df) > 1:
+    if len(feat_df) > 1:
         prev_close = feat_df["close"].iloc[-2]
         if curr["open"] > prev_close * 1.01:
             gap_up = 1
@@ -477,8 +484,7 @@ def analyze_one(ticker: str) -> Optional[Dict[str, Any]]:
         "tp": tp,
         "sl": sl,
         "reason": "اجتاز الفلاتر الفنية",
-        "lastClose": entry,
-        "scores": scores  # يمكن إضافته للتصحيح لكن الواجهة لا تطلبه
+        "lastClose": entry
     }
 
 # ======================== Endpoints ========================
