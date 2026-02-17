@@ -113,13 +113,26 @@ def passes_rules(feat_df: pd.DataFrame):
 def calculate_confidence(feat_df: pd.DataFrame):
     curr = feat_df.iloc[-1]
     score = 0
-    # وزن السيولة أصبح 40%
+    
+    # --- [1] نقاط القوة (السيولة والزخم) ---
     if curr['volume'] > curr['vol_ma20'] * 1.5: score += 40
     elif curr['volume'] > curr['vol_ma20'] * 1.2: score += 25
     
     if (curr['macd'] > curr['macd_signal']): score += 30
     if (curr['close'] > curr['bb_mid']): score += 30
-    return min(100, score)
+    
+    # --- [2] نقاط الخصم (الأمان والتشبع) ---
+    # إذا كان السهم متضخم (RSI > 65)، نخصم 40 نقطة
+    if curr['rsi14'] > 65:
+        score -= 40
+        
+    # إذا كان السعر بعيد جداً عن المتوسط (EMA20)، نخصم 50 نقطة
+    dist = (curr['close'] - curr['ema20']) / curr['ema20']
+    if dist > 0.03:
+        score -= 50
+
+    # نضمن أن النسبة لا تخرج عن نطاق 0-100
+    return max(0, min(100, score))
 
 # =========================
 # 3) المحلل مع الوقف الفني
