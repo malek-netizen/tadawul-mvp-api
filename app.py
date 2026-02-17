@@ -7,7 +7,7 @@ import time
 import os
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import uvicorn
 
 # ======================== إعداد التسجيل ========================
@@ -38,7 +38,7 @@ _prices_cache = {}
 app = FastAPI(
     title="Tadawul Sniper Pro",
     description="محلل فني لأسهم السوق السعودي",
-    version="4.0.1"
+    version="4.0.2"
 )
 
 app.add_middleware(
@@ -48,7 +48,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ======================== التأكد من وجود ملف التيكرات (اختياري) ========================
+# ======================== التأكد من وجود ملف التيكرات ========================
 if not os.path.exists(TICKERS_PATH):
     logger.warning(f"ملف {TICKERS_PATH} غير موجود، سيتم إنشاؤه فارغًا.")
     with open(TICKERS_PATH, "w") as f:
@@ -139,8 +139,6 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     d["atr14"] = tr.rolling(14).mean()
     d["atr_pct"] = d["atr14"] / close * 100
-
-    d["adx"] = 25  # قيمة افتراضية لتجنب الأخطاء
 
     d["vol_ma20"] = volume.rolling(20).mean()
     d["vol_std"] = volume.rolling(20).std()
@@ -259,48 +257,245 @@ def has_bearish_pattern(feat_df):
         return True
     if is_hanging_man(last):
         return True
-# ======================== نقاط نهاية التشخيص (للفحص فقط) ========================
+    if is_evening_star(prev2, prev, last):
+        return True
+    return False
 
+# ======================== شروط الاستبعاد ========================
+def should_exclude(feat_df: pd.DataFrame) -> tuple[bool, str]:
+    """تحديد ما إذا كان السهم مستبعداً بناءً على معايير المخاطرة."""
+    curr = feat_df.iloc[-1]
+    if curr["atr_pct"] > ATR_EXCLUDE_PCT:
+        return True, f"تقلب عالي (ATR% = {curr['atr_pct']:.1f}%)"
+    if len(feat_df) >= 6:
+        close_5 = feat_df["close"].iloc[-6]
+        gain_5 = (curr["close"] / close_5 - 1)
+        if gain_5 > MAX_5DAY_GAIN:
+            return True, f"ارتفاع كبير في 5 أيام ({gain_5*100:.1f}%)"
+    if curr["volume"] < MIN_VOLUME:
+        return True, f"سيولة منخفضة ({curr['volume']:,.0f})"
+    if curr["close"] < MIN_PRICE:
+        return True, f"سعر منخفض جداً ({curr['close']:.2f})"
+    if has_bearish_pattern(feat_df.tail(4)):
+        return True, "وجود نمط هابط"
+    return False, ""
+
+# ======================== الشروط الأساسية ========================
+def passes_core_rules(feat_df: pd.DataFrame) -> tuple[bool, list[str]]:
+    """الشروط الأساسية التي يجب توفرها للنظر في السهم."""
+    reasons = []
+    curr = feat_df.iloc[-1]
+    if not (curr["close"] > curr["ema20"]):
+        reasons.append("السعر تحت EMA20")
+    if not (curr["close"] > curr["sma50"]):
+        reasons.append("السعر تحت SMA50")
+    if not (curr["macd"] > curr["macd_signal"]):
+        reasons.append("MACD أقل من Signal")
+    if not (curr["volume"] > 1.5 * curr["vol_ma20"]):
+        reasons.append("حجم التداول أقل من 1.5x المتوسط")
+    if not (40 < curr["rsi14"] < 70):
+        reasons.append(f"RSI خارج النطاق ({curr['rsi14']:.1f})")
+    dist = (curr["close"] - curr["ema20"]) / curr["ema20"]
+    if dist > 0.05:
+        reasons.append("السعر بعيد جداً عن المتوسط (>5%)")
+    passed = len(reasons) == 0
+    return passed, reasons
+
+# ======================== حساب نقاط المجموعات ========================
+def calculate_group_scores(feat_df: pd.DataFrame) -> dict:
+    """حساب نقاط كل مجموعة (الاتجاه، الزخم، السيولة، الأنماط، المستويات)."""
+    curr = feat_df.iloc[-1]
+    prev = feat_df.iloc[-2]
+    prev2 = feat_df.iloc[-3] if len(feat_df) >= 3 else prev
+    scores = {}
+
+    # 1. مجموعة الاتجاه (وزن 20)
+    trend_conditions = [
+        curr["close"] > curr["ema20"],
+        curr["close"] > curr["sma50"],
+        (feat_df["high"].iloc[-5:] > feat_df["high"].iloc[-6:-1].shift()).all() and \
+        (feat_df["low"].iloc[-5:] > feat_df["low"].iloc[-6:-1].shift()).all()
+    ]
+    scores["trend"] = round((sum(trend_conditions) / len(trend_conditions)) * 20, 2)
+
+    # 2. مجموعة الزخم (وزن 30)
+    momentum_conditions = [
+        curr["macd"] > curr["macd_signal"],
+        40 < curr["rsi14"] < 70,
+        curr["macd_hist"] > prev["macd_hist"],
+        curr["stoch_k"] > curr["stoch_d"]
+    ]
+    scores["momentum"] = round((sum(momentum_conditions) / len(momentum_conditions)) * 30, 2)
+
+    # 3. مجموعة السيولة (وزن 25)
+    volume_conditions = [
+        curr["volume"] > 1.5 * curr["vol_ma20"],
+        curr["obv"] > prev["obv"],
+        curr["volume"] > prev["volume"]
+    ]
+    scores["volume"] = round((sum(volume_conditions) / len(volume_conditions)) * 25, 2)
+
+    # 4. مجموعة الأنماط (وزن 15)
+    scores["pattern"] = get_candle_pattern_score(feat_df)
+
+    # 5. مجموعة المستويات (وزن 10)
+    fib_score = 0
+    if len(feat_df) > 60:
+        recent_high = feat_df["high"].iloc[-60:].max()
+        recent_low = feat_df["low"].iloc[-60:].min()
+        diff = recent_high - recent_low
+        fib_levels = [recent_high - 0.382*diff, recent_high - 0.5*diff, recent_high - 0.618*diff]
+        for level in fib_levels:
+            if abs(curr["close"] - level) / level < 0.01:
+                fib_score = 1
+                break
+    gap_up = 0
+    if len(feat_df) > 1:
+        prev_close = feat_df["close"].iloc[-2]
+        if curr["open"] > prev_close * 1.01:
+            gap_up = 1
+    near_ema = 1 if abs((curr["close"] - curr["ema20"]) / curr["ema20"]) < 0.02 else 0
+    level_conditions = [fib_score, gap_up, near_ema]
+    scores["levels"] = round((sum(level_conditions) / len(level_conditions)) * 10, 2)
+
+    scores["total"] = round(scores["trend"] + scores["momentum"] + scores["volume"] + scores["pattern"] + scores["levels"], 2)
+    return scores
+
+# ======================== دالة التحليل الرئيسية ========================
+def analyze_one(ticker: str) -> Optional[Dict[str, Any]]:
+    t = ticker.strip().upper()
+    if not t.endswith(".SR"):
+        t += ".SR"
+
+    df = fetch_yahoo_prices(t)
+    if df is None:
+        return None
+
+    try:
+        feat_df = build_features(df)
+    except Exception as e:
+        logger.error(f"خطأ في بناء المؤشرات لـ {t}: {e}")
+        return None
+
+    excluded, exclude_reason = should_exclude(feat_df)
+    if excluded:
+        return {
+            "ticker": t,
+            "status": "EXCLUDED",
+            "reason": exclude_reason,
+            "confidence": 0,
+            "entry": round(feat_df.iloc[-1]["close"], 2),
+            "tp": 0,
+            "sl": 0,
+            "lastClose": round(feat_df.iloc[-1]["close"], 2)
+        }
+
+    passed, core_reasons = passes_core_rules(feat_df)
+    if not passed:
+        return {
+            "ticker": t,
+            "status": "REJECTED",
+            "reason": " | ".join(core_reasons),
+            "confidence": 0,
+            "entry": round(feat_df.iloc[-1]["close"], 2),
+            "tp": 0,
+            "sl": 0,
+            "lastClose": round(feat_df.iloc[-1]["close"], 2)
+        }
+
+    scores = calculate_group_scores(feat_df)
+    confidence = scores["total"]
+
+    curr = feat_df.iloc[-1]
+    entry = round(curr["close"], 2)
+    tp = round(entry * (1 + TP_PCT), 2)
+    recent_low = feat_df["low"].tail(3).min()
+    sl_candidate1 = recent_low * 0.99
+    sl_candidate2 = entry - 2 * curr["atr14"]
+    sl = round(min(sl_candidate1, sl_candidate2), 2)
+
+    return {
+        "ticker": t,
+        "status": "APPROVED",
+        "confidence": confidence,
+        "entry": entry,
+        "tp": tp,
+        "sl": sl,
+        "reason": "اجتاز الفلاتر الفنية",
+        "lastClose": entry
+    }
+
+# ======================== Endpoints العامة ========================
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "timestamp": time.time()}
+
+@app.get("/predict")
+async def predict(ticker: str = Query(..., description="رمز السهم مثال: 2222.SR")):
+    result = analyze_one(ticker)
+    if result is None:
+        raise HTTPException(status_code=404, detail="لا توجد بيانات كافية لهذا السهم")
+    return result
+
+@app.get("/top10")
+async def top10():
+    if not os.path.exists(TICKERS_PATH):
+        raise HTTPException(status_code=500, detail=f"ملف {TICKERS_PATH} غير موجود")
+
+    with open(TICKERS_PATH, "r", encoding="utf-8") as f:
+        tickers = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+
+    results = []
+    total_scanned = 0
+
+    with ThreadPoolExecutor(max_workers=TOP10_WORKERS) as executor:
+        futures = {executor.submit(analyze_one, t): t for t in tickers}
+        for future in as_completed(futures):
+            res = future.result()
+            if res:
+                total_scanned += 1
+                if res["status"] == "APPROVED":
+                    results.append(res)
+
+    results.sort(key=lambda x: x["confidence"], reverse=True)
+    return {
+        "items": results[:10],
+        "total_scanned": total_scanned,
+        "timestamp": time.time()
+    }
+
+# ======================== نقاط نهاية التشخيص ========================
 @app.get("/debug/ticker/{ticker}")
 async def debug_ticker(ticker: str):
     """إرجاع معلومات تشخيصية مفصلة عن سهم واحد."""
     t = ticker.strip().upper()
     if not t.endswith(".SR"):
         t += ".SR"
-    
+
     df = fetch_yahoo_prices(t)
     if df is None:
         return {"error": "لا توجد بيانات لهذا السهم"}
-    
+
     try:
         feat_df = build_features(df)
     except Exception as e:
         return {"error": f"فشل بناء المؤشرات: {str(e)}"}
-    
+
     if feat_df is None or len(feat_df) == 0:
         return {"error": "البيانات غير كافية لحساب المؤشرات"}
-    
-    # آخر 5 أيام من البيانات الخام (قبل حساب المؤشرات)
+
     raw_last5 = df.tail(5).to_dict(orient="records")
-    
-    # آخر يوم من المؤشرات المحسوبة (تحويل القيم numpy إلى float/json)
     curr = feat_df.iloc[-1].to_dict()
-    # تحويل أي قيم numpy إلى أنواع python قياسية
     for k, v in curr.items():
         if isinstance(v, (np.integer, np.floating)):
             curr[k] = float(v)
         elif isinstance(v, np.bool_):
             curr[k] = bool(v)
-    
-    # فحص الشروط الأساسية
+
     passed, reasons = passes_core_rules(feat_df)
-    
-    # فحص الاستبعاد
     excluded, exclude_reason = should_exclude(feat_df)
-    
-    # نقاط المجموعات
     scores = calculate_group_scores(feat_df)
-    
+
     return {
         "ticker": t,
         "raw_last_5": raw_last5,
@@ -312,45 +507,40 @@ async def debug_ticker(ticker: str):
         "group_scores": scores
     }
 
-
-# دالة مساعدة لجمع إحصائيات debug_summary (دون تخزين النتائج كاملة)
 def analyze_one_debug(ticker: str):
     """نسخة مبسطة من analyze_one لإرجاع الحالة والسبب فقط."""
     t = ticker.strip().upper()
     if not t.endswith(".SR"):
         t += ".SR"
-    
+
     df = fetch_yahoo_prices(t)
     if df is None:
         return None
-    
+
     try:
         feat_df = build_features(df)
     except Exception:
         return None
-    
-    # الاستبعاد أولاً
+
     excluded, exclude_reason = should_exclude(feat_df)
     if excluded:
         return {"status": "EXCLUDED", "reason": exclude_reason}
-    
-    # الشروط الأساسية
+
     passed, reasons = passes_core_rules(feat_df)
     if not passed:
         return {"status": "REJECTED", "reason": " | ".join(reasons)}
-    
-    return {"status": "APPROVED", "reason": ""}
 
+    return {"status": "APPROVED", "reason": ""}
 
 @app.get("/debug/summary")
 async def debug_summary():
     """تحليل جميع الأسهم وإرجاع إحصائيات حول أسباب الرفض والاستبعاد."""
     if not os.path.exists(TICKERS_PATH):
         raise HTTPException(status_code=500, detail=f"ملف {TICKERS_PATH} غير موجود")
-    
+
     with open(TICKERS_PATH, "r", encoding="utf-8") as f:
         tickers = [line.strip() for line in f if line.strip() and not line.startswith("#")]
-    
+
     stats = {
         "total": 0,
         "excluded_count": 0,
@@ -359,13 +549,13 @@ async def debug_summary():
         "core_failed_reasons": {},
         "approved_count": 0
     }
-    
+
     with ThreadPoolExecutor(max_workers=TOP10_WORKERS) as executor:
         futures = {executor.submit(analyze_one_debug, t): t for t in tickers}
         for future in as_completed(futures):
             res = future.result()
             if res is None:
-                continue  # تجاهل الأسهم التي فشل جلب بياناتها
+                continue
             stats["total"] += 1
             if res["status"] == "EXCLUDED":
                 stats["excluded_count"] += 1
@@ -373,11 +563,13 @@ async def debug_summary():
                 stats["excluded_reasons"][reason] = stats["excluded_reasons"].get(reason, 0) + 1
             elif res["status"] == "REJECTED":
                 stats["core_failed_count"] += 1
-                # قد يكون هناك عدة أسباب مفصولة بـ " | "
                 reasons_list = res["reason"].split(" | ")
                 for r in reasons_list:
                     stats["core_failed_reasons"][r] = stats["core_failed_reasons"].get(r, 0) + 1
             elif res["status"] == "APPROVED":
                 stats["approved_count"] += 1
-    
+
     return stats
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
