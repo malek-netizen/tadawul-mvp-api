@@ -7,7 +7,7 @@ import time
 import os
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 import uvicorn
 
 # ======================== إعداد التسجيل ========================
@@ -26,10 +26,31 @@ TICKERS_PATH = os.getenv("TICKERS_PATH", "tickers_sa.txt")
 TP_PCT = float(os.getenv("TP_PCT", "0.05"))
 TOP10_WORKERS = int(os.getenv("TOP10_WORKERS", "10"))
 CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "600"))
-MIN_VOLUME = int(os.getenv("MIN_VOLUME", "200000"))      # تم تخفيضه إلى 200,000
-MIN_PRICE = float(os.getenv("MIN_PRICE", "5.0"))          # ثابت
-ATR_EXCLUDE_PCT = float(os.getenv("ATR_EXCLUDE_PCT", "6.5"))  # رفع إلى 6.5%
-MAX_5DAY_GAIN = float(os.getenv("MAX_5DAY_GAIN", "0.15"))      # ثابت
+
+# إعدادات استراتيجية الصعود
+UPTREND_MIN_VOLUME = int(os.getenv("UPTREND_MIN_VOLUME", "200000"))
+UPTREND_MIN_PRICE = float(os.getenv("UPTREND_MIN_PRICE", "5.0"))
+UPTREND_ATR_LIMIT = float(os.getenv("UPTREND_ATR_LIMIT", "4.5"))
+UPTREND_RSI_MIN = float(os.getenv("UPTREND_RSI_MIN", "30"))
+UPTREND_RSI_MAX = float(os.getenv("UPTREND_RSI_MAX", "70"))
+UPTREND_VOL_RATIO = float(os.getenv("UPTREND_VOL_RATIO", "1.0"))
+UPTREND_DIST_MIN = float(os.getenv("UPTREND_DIST_MIN", "0.0"))
+UPTREND_DIST_MAX = float(os.getenv("UPTREND_DIST_MAX", "5.0"))
+UPTREND_REQUIRE_MACD = os.getenv("UPTREND_REQUIRE_MACD", "true").lower() == "true"
+
+# إعدادات استراتيجية القيعان
+BOTTOM_MIN_VOLUME = int(os.getenv("BOTTOM_MIN_VOLUME", "200000"))
+BOTTOM_MIN_PRICE = float(os.getenv("BOTTOM_MIN_PRICE", "5.0"))
+BOTTOM_ATR_LIMIT = float(os.getenv("BOTTOM_ATR_LIMIT", "6.0"))
+BOTTOM_RSI_MAX = float(os.getenv("BOTTOM_RSI_MAX", "45"))
+BOTTOM_DIST_MIN = float(os.getenv("BOTTOM_DIST_MIN", "-12.0"))
+BOTTOM_DIST_MAX = float(os.getenv("BOTTOM_DIST_MAX", "-2.0"))
+BOTTOM_MIN_VOL_RATIO = float(os.getenv("BOTTOM_MIN_VOL_RATIO", "0.8"))
+BOTTOM_PATTERN_WEIGHT = int(os.getenv("BOTTOM_PATTERN_WEIGHT", "30"))
+BOTTOM_RSI_WEIGHT = int(os.getenv("BOTTOM_RSI_WEIGHT", "20"))
+BOTTOM_VOL_WEIGHT = int(os.getenv("BOTTOM_VOL_WEIGHT", "15"))
+BOTTOM_DIST_WEIGHT = int(os.getenv("BOTTOM_DIST_WEIGHT", "15"))
+BOTTOM_BB_WEIGHT = int(os.getenv("BOTTOM_BB_WEIGHT", "10"))
 
 # ======================== كاش بسيط يدوي ========================
 _prices_cache = {}
@@ -37,8 +58,8 @@ _prices_cache = {}
 # ======================== إنشاء تطبيق FastAPI ========================
 app = FastAPI(
     title="Tadawul Sniper Pro",
-    description="محلل فني لأسهم السوق السعودي",
-    version="4.0.4"  # رقم الإصدار محدث
+    description="محلل فني لأسهم السوق السعودي - يدعم استراتيجيتي الصعود واقتناص القيعان",
+    version="5.0.0"
 )
 
 app.add_middleware(
@@ -91,7 +112,7 @@ def fetch_yahoo_prices(ticker: str, range_: str = "1y", interval: str = "1d") ->
         logger.error(f"خطأ في جلب {ticker}: {str(e)}")
         return None
 
-# ======================== حساب المؤشرات الفنية يدويًا ========================
+# ======================== حساب المؤشرات الفنية (مع Bollinger Bands كاملة) ========================
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
     close = d["close"]
@@ -114,10 +135,13 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     d["rsi14"] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
 
+    # Bollinger Bands
     d["bb_mid"] = d["sma20"]
     d["bb_std"] = close.rolling(20).std()
     d["bb_upper"] = d["bb_mid"] + 2 * d["bb_std"]
+    d["bb_lower"] = d["bb_mid"] - 2 * d["bb_std"]
 
+    # OBV
     obv = [0]
     for i in range(1, len(close)):
         if close.iloc[i] > close.iloc[i-1]:
@@ -142,72 +166,41 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
     d["vol_ma20"] = volume.rolling(20).mean()
     d["vol_std"] = volume.rolling(20).std()
+    d["vol_ratio"] = volume / d["vol_ma20"]
 
     d["candle_green"] = close > d["open"]
     d["body"] = abs(close - d["open"])
     d["upper_shadow"] = high - d[["close", "open"]].max(axis=1)
     d["lower_shadow"] = d[["close", "open"]].min(axis=1) - low
+    d["dist_from_ema20"] = (close - d["ema20"]) / d["ema20"] * 100
+
+    # أنماط انعكاسية مبسطة
+    d["prev_close"] = close.shift(1)
+    d["prev_open"] = d["open"].shift(1)
+    d["prev_low"] = low.shift(1)
+    d["prev_high"] = high.shift(1)
+
+    # مطرقة (Hammer)
+    body = d["body"]
+    lower = d["lower_shadow"]
+    upper = d["upper_shadow"]
+    d["is_hammer"] = (lower > 2 * body) & (upper < 0.3 * body)
+
+    # ابتلاع شرائي (Bullish Engulfing)
+    d["is_bullish_engulfing"] = (
+        (d["prev_close"] < d["prev_open"]) &          # شمعة سابقة حمراء
+        (close > d["open"]) &                         # شمعة حالية خضراء
+        (d["open"] < d["prev_close"]) &               # تفتح تحت إغلاق السابقة
+        (close > d["prev_open"])                       # تغلق فوق افتتاح السابقة
+    )
+
+    # دوجي (Doji)
+    d["is_doji"] = d["body"] < 0.1 * (high - low)
 
     d = d.dropna().reset_index(drop=True)
     return d
 
-# ======================== دوال الأنماط السعرية ========================
-def is_bullish_engulfing(prev, curr):
-    prev_red = prev["close"] < prev["open"]
-    curr_green = curr["close"] > curr["open"]
-    if not (prev_red and curr_green):
-        return False
-    return curr["open"] < prev["close"] and curr["close"] > prev["open"]
-
-def is_hammer(candle):
-    body = candle["body"]
-    lower = candle["lower_shadow"]
-    upper = candle["upper_shadow"]
-    return lower > 2 * body and upper < 0.3 * body
-
-def is_morning_star(c1, c2, c3):
-    c1_red = c1["close"] < c1["open"]
-    c3_green = c3["close"] > c3["open"]
-    c2_small = c2["body"] < 0.1 * (c1["high"] - c1["low"])
-    if not (c1_red and c3_green and c2_small):
-        return False
-    midpoint = (c1["open"] + c1["close"]) / 2
-    return c3["close"] > midpoint
-
-def is_piercing(prev, curr):
-    if not (prev["close"] < prev["open"] and curr["close"] > curr["open"]):
-        return False
-    midpoint = (prev["open"] + prev["close"]) / 2
-    return curr["close"] > midpoint and curr["open"] < prev["close"]
-
-def get_candle_pattern_score(feat_df):
-    if len(feat_df) < 3:
-        return 0
-    last = feat_df.iloc[-1]
-    prev = feat_df.iloc[-2]
-    prev2 = feat_df.iloc[-3]
-
-    score = 0
-    if is_bullish_engulfing(prev, last):
-        score += 15
-    elif is_morning_star(prev2, prev, last):
-        score += 15
-    elif is_piercing(prev, last):
-        score += 12
-    elif is_hammer(last) and (prev["close"] < prev["open"]):
-        score += 12
-    elif last["candle_green"]:
-        body_pct = last["body"] / (last["high"] - last["low"]) if (last["high"]-last["low"])>0 else 0
-        if body_pct > 0.5:
-            score += 5
-        else:
-            score += 2
-
-    if last["upper_shadow"] > 2 * last["body"]:
-        score -= 3
-
-    return max(0, min(15, score))
-
+# ======================== دوال الأنماط الهابطة (للاستبعاد) ========================
 def is_bearish_engulfing(prev, curr):
     prev_green = prev["close"] > prev["open"]
     curr_red = curr["close"] < curr["open"]
@@ -261,103 +254,69 @@ def has_bearish_pattern(feat_df):
         return True
     return False
 
-# ======================== شروط الاستبعاد ========================
-def should_exclude(feat_df: pd.DataFrame) -> tuple[bool, str]:
-    """تحديد ما إذا كان السهم مستبعداً بناءً على معايير المخاطرة."""
-    curr = feat_df.iloc[-1]
-    # 1. التقلب العالي (ATR%)
-    if curr["atr_pct"] > ATR_EXCLUDE_PCT:
-        return True, f"تقلب عالي (ATR% = {curr['atr_pct']:.1f}%)"
-    # 2. ارتفاع كبير في آخر 5 أيام
-    if len(feat_df) >= 6:
-        close_5 = feat_df["close"].iloc[-6]
-        gain_5 = (curr["close"] / close_5 - 1)
-        if gain_5 > MAX_5DAY_GAIN:
-            return True, f"ارتفاع كبير في 5 أيام ({gain_5*100:.1f}%)"
-    # 3. سيولة منخفضة جداً
-    if curr["volume"] < MIN_VOLUME:
-        return True, f"سيولة منخفضة ({curr['volume']:,.0f})"
-    # 4. سعر منخفض جداً
-    if curr["close"] < MIN_PRICE:
-        return True, f"سعر منخفض جداً ({curr['close']:.2f})"
-    # 5. وجود نمط هابط
-    if has_bearish_pattern(feat_df.tail(4)):
-        return True, "وجود نمط هابط"
-    return False, ""
+# ======================== دوال حساب الثقة للصعود (مأخوذة من calculate_group_scores سابقاً) ========================
+def get_candle_pattern_score(feat_df):
+    if len(feat_df) < 3:
+        return 0
+    last = feat_df.iloc[-1]
+    prev = feat_df.iloc[-2]
+    prev2 = feat_df.iloc[-3]
 
-# ======================== الشروط الأساسية (المعدلة) ========================
-def passes_core_rules(feat_df: pd.DataFrame) -> tuple[bool, list[str]]:
-    """الشروط الأساسية المعدلة بناءً على تحليل 2415 يومًا قويًا (نسخة التوازن)"""
-    reasons = []
-    curr = feat_df.iloc[-1]
-    
-    # 1. RSI (20-80)
-    if not (20 < curr["rsi14"] < 80):
-        reasons.append(f"RSI خارج النطاق ({curr['rsi14']:.1f})")
-    
-    # 2. حجم التداول (أكبر من 0.5x المتوسط)
-    if not (curr["volume"] > 0.5 * curr["vol_ma20"]):
-        reasons.append(f"حجم التداول أقل من 0.5x المتوسط ({curr['volume']/curr['vol_ma20']:.2f}x)")
-    
-    # 3. المسافة عن EMA20 (السماح بالارتدادات من تحت)
-    dist = (curr["close"] - curr["ema20"]) / curr["ema20"] * 100  # كنسبة مئوية
-    if not (-10 < dist < 11):
-        reasons.append(f"السعر بعيد جداً عن EMA20 ({dist:.1f}%)")
-    
-    # 4. الاتجاه العام (فوق SMA50)
-    if not (curr["close"] > curr["sma50"]):
-        reasons.append("السعر تحت SMA50")
-    
-    # 5. بعد فوق المتوسط (بعيد جداً) - اختياري لكنه مفيد
-    if dist > 11:
-        reasons.append("السعر بعيد جداً عن المتوسط (>11%)")
-    
-    passed = len(reasons) == 0
-    return passed, reasons
+    score = 0
+    if 'is_bullish_engulfing' in last and last['is_bullish_engulfing']:
+        score += 15
+    elif 'is_hammer' in last and last['is_hammer'] and (prev["close"] < prev["open"]):
+        score += 12
+    elif last["candle_green"]:
+        body_pct = last["body"] / (last["high"] - last["low"]) if (last["high"]-last["low"])>0 else 0
+        if body_pct > 0.5:
+            score += 5
+        else:
+            score += 2
+    if last["upper_shadow"] > 2 * last["body"]:
+        score -= 3
+    return max(0, min(15, score))
 
-# ======================== حساب نقاط المجموعات ========================
-def calculate_group_scores(feat_df: pd.DataFrame) -> dict:
-    """حساب نقاط كل مجموعة (الاتجاه، الزخم، السيولة، الأنماط، المستويات)."""
+def calculate_uptrend_confidence(feat_df: pd.DataFrame) -> float:
+    """حساب الثقة للاستراتيجية الصاعدة (0-100)"""
     curr = feat_df.iloc[-1]
     prev = feat_df.iloc[-2]
-    prev2 = feat_df.iloc[-3] if len(feat_df) >= 3 else prev
     scores = {}
 
-    # 1. مجموعة الاتجاه (وزن 20)
+    # مجموعة الاتجاه (20)
     highs_5 = feat_df["high"].iloc[-5:].values
     lows_5 = feat_df["low"].iloc[-5:].values
     trend_hh = all(highs_5[i] > highs_5[i-1] for i in range(1, len(highs_5)))
     trend_hl = all(lows_5[i] > lows_5[i-1] for i in range(1, len(lows_5)))
-    
     trend_conditions = [
         curr["close"] > curr["ema20"],
         curr["close"] > curr["sma50"],
         trend_hh and trend_hl
     ]
-    scores["trend"] = round((sum(trend_conditions) / len(trend_conditions)) * 20, 2)
+    scores["trend"] = (sum(trend_conditions) / 3) * 20
 
-    # 2. مجموعة الزخم (وزن 30)
+    # مجموعة الزخم (30)
     momentum_conditions = [
-        # تم إلغاء MACD > Signal كشرط أساسي، لكنه هنا في مجموعة الثقة
         curr["macd"] > curr["macd_signal"],
-        20 < curr["rsi14"] < 80,
+        UPTREND_RSI_MIN < curr["rsi14"] < UPTREND_RSI_MAX,
         curr["macd_hist"] > prev["macd_hist"],
         curr["stoch_k"] > curr["stoch_d"]
     ]
-    scores["momentum"] = round((sum(momentum_conditions) / 4) * 30, 2)  # 4 شروط
+    scores["momentum"] = (sum(momentum_conditions) / 4) * 30
 
-    # 3. مجموعة السيولة (وزن 25)
+    # مجموعة السيولة (25)
     volume_conditions = [
-        curr["volume"] > 0.5 * curr["vol_ma20"],
+        curr["volume"] > curr["vol_ma20"],
         curr["obv"] > prev["obv"],
         curr["volume"] > prev["volume"]
     ]
-    scores["volume"] = round((sum(volume_conditions) / 3) * 25, 2)
+    scores["volume"] = (sum(volume_conditions) / 3) * 25
 
-    # 4. مجموعة الأنماط (وزن 15)
+    # مجموعة الأنماط (15)
     scores["pattern"] = get_candle_pattern_score(feat_df)
 
-    # 5. مجموعة المستويات (وزن 10)
+    # مجموعة المستويات (10)
+    # فيبوناتشي بسيط
     fib_score = 0
     if len(feat_df) > 60:
         recent_high = feat_df["high"].iloc[-60:].max()
@@ -373,14 +332,131 @@ def calculate_group_scores(feat_df: pd.DataFrame) -> dict:
         prev_close = feat_df["close"].iloc[-2]
         if curr["open"] > prev_close * 1.01:
             gap_up = 1
-    near_ema = 1 if abs((curr["close"] - curr["ema20"]) / curr["ema20"]) < 0.02 else 0
+    near_ema = 1 if abs(curr["dist_from_ema20"]) < 2 else 0
     level_conditions = [fib_score, gap_up, near_ema]
-    scores["levels"] = round((sum(level_conditions) / 3) * 10, 2)
+    scores["levels"] = (sum(level_conditions) / 3) * 10
 
-    scores["total"] = round(scores["trend"] + scores["momentum"] + scores["volume"] + scores["pattern"] + scores["levels"], 2)
-    return scores
-    
-# ======================== دالة التحليل الرئيسية ========================
+    total = scores["trend"] + scores["momentum"] + scores["volume"] + scores["pattern"] + scores["levels"]
+    return total
+
+# ======================== حساب الثقة لاستراتيجية القيعان ========================
+def calculate_bottom_confidence(feat_df: pd.DataFrame) -> float:
+    """حساب الثقة للاستراتيجية القاعية (0-100)"""
+    curr = feat_df.iloc[-1]
+    prev = feat_df.iloc[-2]
+
+    score = 0
+    # 1. النمط الانعكاسي (وزن كبير)
+    pattern_score = 0
+    if curr.get("is_hammer", False):
+        pattern_score = 30
+    elif curr.get("is_bullish_engulfing", False):
+        pattern_score = 30
+    elif curr.get("is_doji", False):
+        pattern_score = 15  # دوجي أقل قوة
+    score += pattern_score
+
+    # 2. RSI (كلما قل، زادت النقاط)
+    rsi = curr["rsi14"]
+    if rsi < BOTTOM_RSI_MAX:
+        # نقاط تتناسب عكسياً مع RSI: مثلاً 20 نقطة إذا كان rsi=20، و0 إذا كان rsi=45
+        rsi_points = max(0, BOTTOM_RSI_WEIGHT * (1 - (rsi - 20) / (BOTTOM_RSI_MAX - 20))) if rsi > 20 else BOTTOM_RSI_WEIGHT
+        score += rsi_points
+
+    # 3. حجم يوم النمط
+    vol_ratio = curr.get("vol_ratio", 0)
+    if vol_ratio >= BOTTOM_MIN_VOL_RATIO:
+        # كلما زاد الحجم، زادت النقاط حتى وزن معين
+        vol_points = min(BOTTOM_VOL_WEIGHT, vol_ratio * 5)  # 1x = 5 نقاط، 2x = 10، 3x = 15
+        score += vol_points
+
+    # 4. المسافة تحت EMA20 (كلما كانت أكبر (أكثر سالباً)، زادت النقاط)
+    dist = curr["dist_from_ema20"]
+    if dist < 0:
+        # مثال: -2% تعطي 5 نقاط، -10% تعطي 15 نقطة
+        dist_points = min(BOTTOM_DIST_WEIGHT, abs(dist) * 1.5)
+        score += dist_points
+
+    # 5. ملامسة الحد السفلي لبولينجر
+    if curr["close"] <= curr["bb_lower"]:
+        score += BOTTOM_BB_WEIGHT
+    elif curr["close"] < curr["bb_mid"]:
+        # قريب من الحد السفلي ولكن ليس تحته
+        score += BOTTOM_BB_WEIGHT // 2
+
+    # 6. (اختياري) تباعد إيجابي: السعر يصنع قاعاً أدنى و RSI قاعاً أعلى خلال آخر 5 أيام
+    # يمكن إضافته لاحقاً
+
+    return min(100, max(0, score))
+
+# ======================== شروط القبول للصعود ========================
+def passes_uptrend(feat_df: pd.DataFrame) -> Tuple[bool, List[str]]:
+    reasons = []
+    curr = feat_df.iloc[-1]
+
+    # شروط أساسية
+    if not (UPTREND_RSI_MIN < curr["rsi14"] < UPTREND_RSI_MAX):
+        reasons.append(f"RSI خارج {UPTREND_RSI_MIN}-{UPTREND_RSI_MAX}")
+    if not (curr["volume"] > UPTREND_VOL_RATIO * curr["vol_ma20"]):
+        reasons.append(f"حجم < {UPTREND_VOL_RATIO}x المتوسط")
+    dist = curr["dist_from_ema20"]
+    if not (UPTREND_DIST_MIN <= dist <= UPTREND_DIST_MAX):
+        reasons.append(f"المسافة عن EMA20 خارج [{UPTREND_DIST_MIN},{UPTREND_DIST_MAX}]%")
+    if not (curr["close"] > curr["sma50"]):
+        reasons.append("السعر تحت SMA50")
+    if UPTREND_REQUIRE_MACD and not (curr["macd"] > curr["macd_signal"]):
+        reasons.append("MACD أقل من Signal")
+
+    # شروط استبعاد أساسية
+    if curr["volume"] < UPTREND_MIN_VOLUME:
+        reasons.append(f"حجم < {UPTREND_MIN_VOLUME}")
+    if curr["close"] < UPTREND_MIN_PRICE:
+        reasons.append(f"سعر < {UPTREND_MIN_PRICE}")
+    if curr["atr_pct"] > UPTREND_ATR_LIMIT:
+        reasons.append(f"تقلب > {UPTREND_ATR_LIMIT}%")
+    if has_bearish_pattern(feat_df.tail(4)):
+        reasons.append("نمط هابط")
+
+    passed = len(reasons) == 0
+    return passed, reasons
+
+# ======================== شروط القبول للقيعان ========================
+def passes_bottom(feat_df: pd.DataFrame) -> Tuple[bool, List[str]]:
+    reasons = []
+    curr = feat_df.iloc[-1]
+
+    # 1. RSI منخفض
+    if curr["rsi14"] > BOTTOM_RSI_MAX:
+        reasons.append(f"RSI > {BOTTOM_RSI_MAX}")
+
+    # 2. المسافة تحت EMA20 ضمن النطاق
+    dist = curr["dist_from_ema20"]
+    if not (BOTTOM_DIST_MIN <= dist <= BOTTOM_DIST_MAX):
+        reasons.append(f"المسافة عن EMA20 خارج [{BOTTOM_DIST_MIN},{BOTTOM_DIST_MAX}]%")
+
+    # 3. وجود نمط انعكاسي
+    has_pattern = curr.get("is_hammer", False) or curr.get("is_bullish_engulfing", False) or curr.get("is_doji", False)
+    if not has_pattern:
+        reasons.append("لا يوجد نمط انعكاسي (مطرقة، ابتلاع، دوجي)")
+
+    # 4. حجم يوم النمط (نسبة إلى المتوسط)
+    if curr["vol_ratio"] < BOTTOM_MIN_VOL_RATIO:
+        reasons.append(f"حجم يوم النمط < {BOTTOM_MIN_VOL_RATIO}x المتوسط")
+
+    # شروط استبعاد أساسية
+    if curr["volume"] < BOTTOM_MIN_VOLUME:
+        reasons.append(f"حجم < {BOTTOM_MIN_VOLUME}")
+    if curr["close"] < BOTTOM_MIN_PRICE:
+        reasons.append(f"سعر < {BOTTOM_MIN_PRICE}")
+    if curr["atr_pct"] > BOTTOM_ATR_LIMIT:
+        reasons.append(f"تقلب > {BOTTOM_ATR_LIMIT}%")
+
+    # لا نستبعد الأنماط الهابطة هنا لأننا نبحث عن القيعان
+
+    passed = len(reasons) == 0
+    return passed, reasons
+
+# ======================== دالة التحليل الرئيسية (تنتج نتائج لكلتا الاستراتيجيتين) ========================
 def analyze_one(ticker: str) -> Optional[Dict[str, Any]]:
     t = ticker.strip().upper()
     if not t.endswith(".SR"):
@@ -396,37 +472,6 @@ def analyze_one(ticker: str) -> Optional[Dict[str, Any]]:
         logger.error(f"خطأ في بناء المؤشرات لـ {t}: {e}")
         return None
 
-    excluded, exclude_reason = should_exclude(feat_df)
-    if excluded:
-        return {
-            "ticker": t,
-            "status": "EXCLUDED",
-            "recommendation": "NO_TRADE",
-            "confidence": 0.0,
-            "entry": round(feat_df.iloc[-1]["close"], 2),
-            "tp": 0.0,
-            "sl": 0.0,
-            "reason": exclude_reason,
-            "lastClose": round(feat_df.iloc[-1]["close"], 2)
-        }
-
-    passed, core_reasons = passes_core_rules(feat_df)
-    if not passed:
-        return {
-            "ticker": t,
-            "status": "REJECTED",
-            "recommendation": "NO_TRADE",
-            "confidence": 0.0,
-            "entry": round(feat_df.iloc[-1]["close"], 2),
-            "tp": 0.0,
-            "sl": 0.0,
-            "reason": " | ".join(core_reasons),
-            "lastClose": round(feat_df.iloc[-1]["close"], 2)
-        }
-
-    scores = calculate_group_scores(feat_df)
-    confidence = scores["total"] / 100.0  # تحويل إلى كسر عشري
-
     curr = feat_df.iloc[-1]
     entry = round(curr["close"], 2)
     tp = round(entry * (1 + TP_PCT), 2)
@@ -435,19 +480,38 @@ def analyze_one(ticker: str) -> Optional[Dict[str, Any]]:
     sl_candidate2 = entry - 2 * curr["atr14"]
     sl = round(min(sl_candidate1, sl_candidate2), 2)
 
-    return {
-        "ticker": t,
-        "status": "APPROVED",
-        "recommendation": "BUY",
-        "confidence": confidence,
+    # تحليل الصعود
+    uptrend_passed, uptrend_reasons = passes_uptrend(feat_df)
+    uptrend_conf = calculate_uptrend_confidence(feat_df) / 100.0 if uptrend_passed else 0.0
+    uptrend_result = {
+        "status": "APPROVED" if uptrend_passed else "REJECTED",
+        "confidence": uptrend_conf,
         "entry": entry,
         "tp": tp,
         "sl": sl,
-        "reason": "اجتاز الفلاتر الفنية",
-        "lastClose": entry
+        "reason": "اجتاز فلاتر الصعود" if uptrend_passed else " | ".join(uptrend_reasons)
     }
 
-# ======================== Endpoints العامة ========================
+    # تحليل القيعان
+    bottom_passed, bottom_reasons = passes_bottom(feat_df)
+    bottom_conf = calculate_bottom_confidence(feat_df) / 100.0 if bottom_passed else 0.0
+    bottom_result = {
+        "status": "APPROVED" if bottom_passed else "REJECTED",
+        "confidence": bottom_conf,
+        "entry": entry,
+        "tp": tp,
+        "sl": sl,
+        "reason": "اجتاز فلاتر القيعان" if bottom_passed else " | ".join(bottom_reasons)
+    }
+
+    return {
+        "ticker": t,
+        "lastClose": entry,
+        "uptrend": uptrend_result,
+        "bottom": bottom_result
+    }
+
+# ======================== Endpoints ========================
 @app.get("/health")
 async def health_check():
     return {"status": "ok", "timestamp": time.time()}
@@ -467,7 +531,8 @@ async def top10():
     with open(TICKERS_PATH, "r", encoding="utf-8") as f:
         tickers = [line.strip() for line in f if line.strip() and not line.startswith("#")]
 
-    results = []
+    uptrend_results = []
+    bottom_results = []
     total_scanned = 0
 
     with ThreadPoolExecutor(max_workers=TOP10_WORKERS) as executor:
@@ -476,37 +541,50 @@ async def top10():
             res = future.result()
             if res:
                 total_scanned += 1
-                if res["status"] == "APPROVED":
-                    results.append(res)
+                if res["uptrend"]["status"] == "APPROVED":
+                    uptrend_results.append({
+                        "ticker": res["ticker"],
+                        "confidence": res["uptrend"]["confidence"],
+                        "entry": res["uptrend"]["entry"],
+                        "tp": res["uptrend"]["tp"],
+                        "sl": res["uptrend"]["sl"],
+                        "reason": res["uptrend"]["reason"],
+                        "lastClose": res["lastClose"]
+                    })
+                if res["bottom"]["status"] == "APPROVED":
+                    bottom_results.append({
+                        "ticker": res["ticker"],
+                        "confidence": res["bottom"]["confidence"],
+                        "entry": res["bottom"]["entry"],
+                        "tp": res["bottom"]["tp"],
+                        "sl": res["bottom"]["sl"],
+                        "reason": res["bottom"]["reason"],
+                        "lastClose": res["lastClose"]
+                    })
 
-    results.sort(key=lambda x: x["confidence"], reverse=True)
+    # ترتيب تنازلي حسب الثقة
+    uptrend_results.sort(key=lambda x: x["confidence"], reverse=True)
+    bottom_results.sort(key=lambda x: x["confidence"], reverse=True)
+
     return {
-        "items": results[:10],
+        "uptrend": uptrend_results[:10],
+        "bottom": bottom_results[:10],
         "total_scanned": total_scanned,
         "timestamp": time.time()
     }
 
-# ======================== نقاط نهاية التشخيص ========================
+# ======================== نقاط التشخيص (اختياري) ========================
 @app.get("/debug/ticker/{ticker}")
 async def debug_ticker(ticker: str):
-    """إرجاع معلومات تشخيصية مفصلة عن سهم واحد."""
     t = ticker.strip().upper()
     if not t.endswith(".SR"):
         t += ".SR"
 
     df = fetch_yahoo_prices(t)
     if df is None:
-        return {"error": "لا توجد بيانات لهذا السهم"}
+        return {"error": "لا توجد بيانات"}
 
-    try:
-        feat_df = build_features(df)
-    except Exception as e:
-        return {"error": f"فشل بناء المؤشرات: {str(e)}"}
-
-    if feat_df is None or len(feat_df) == 0:
-        return {"error": "البيانات غير كافية لحساب المؤشرات"}
-
-    raw_last5 = df.tail(5).to_dict(orient="records")
+    feat_df = build_features(df)
     curr = feat_df.iloc[-1].to_dict()
     for k, v in curr.items():
         if isinstance(v, (np.integer, np.floating)):
@@ -514,84 +592,14 @@ async def debug_ticker(ticker: str):
         elif isinstance(v, np.bool_):
             curr[k] = bool(v)
 
-    passed, reasons = passes_core_rules(feat_df)
-    excluded, exclude_reason = should_exclude(feat_df)
-    scores = calculate_group_scores(feat_df)
-
     return {
         "ticker": t,
-        "raw_last_5": raw_last5,
-        "indicators_last": curr,
-        "core_rules_passed": passed,
-        "core_rules_reasons": reasons,
-        "excluded": excluded,
-        "exclude_reason": exclude_reason,
-        "group_scores": scores
+        "last_indicators": curr,
+        "uptrend": passes_uptrend(feat_df)[0],
+        "uptrend_confidence": calculate_uptrend_confidence(feat_df),
+        "bottom": passes_bottom(feat_df)[0],
+        "bottom_confidence": calculate_bottom_confidence(feat_df)
     }
-
-def analyze_one_debug(ticker: str):
-    """نسخة مبسطة من analyze_one لإرجاع الحالة والسبب فقط."""
-    t = ticker.strip().upper()
-    if not t.endswith(".SR"):
-        t += ".SR"
-
-    df = fetch_yahoo_prices(t)
-    if df is None:
-        return None
-
-    try:
-        feat_df = build_features(df)
-    except Exception:
-        return None
-
-    excluded, exclude_reason = should_exclude(feat_df)
-    if excluded:
-        return {"status": "EXCLUDED", "reason": exclude_reason}
-
-    passed, reasons = passes_core_rules(feat_df)
-    if not passed:
-        return {"status": "REJECTED", "reason": " | ".join(reasons)}
-
-    return {"status": "APPROVED", "reason": ""}
-
-@app.get("/debug/summary")
-async def debug_summary():
-    """تحليل جميع الأسهم وإرجاع إحصائيات حول أسباب الرفض والاستبعاد."""
-    if not os.path.exists(TICKERS_PATH):
-        raise HTTPException(status_code=500, detail=f"ملف {TICKERS_PATH} غير موجود")
-
-    with open(TICKERS_PATH, "r", encoding="utf-8") as f:
-        tickers = [line.strip() for line in f if line.strip() and not line.startswith("#")]
-
-    stats = {
-        "total": 0,
-        "excluded_count": 0,
-        "excluded_reasons": {},
-        "core_failed_count": 0,
-        "core_failed_reasons": {},
-        "approved_count": 0
-    }
-
-    with ThreadPoolExecutor(max_workers=TOP10_WORKERS) as executor:
-        futures = {executor.submit(analyze_one_debug, t): t for t in tickers}
-        for future in as_completed(futures):
-            res = future.result()
-            if res is None:
-                continue
-            stats["total"] += 1
-            if res["status"] == "EXCLUDED":
-                stats["excluded_count"] += 1
-                reason = res["reason"]
-                stats["excluded_reasons"][reason] = stats["excluded_reasons"].get(reason, 0) + 1
-            elif res["status"] == "REJECTED":
-                stats["core_failed_count"] += 1
-                reasons_list = res["reason"].split(" | ")
-                for r in reasons_list:
-                    stats["core_failed_reasons"][r] = stats["core_failed_reasons"].get(r, 0) + 1
-            elif res["status"] == "APPROVED":
-                stats["approved_count"] += 1
-
-    return stats
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
