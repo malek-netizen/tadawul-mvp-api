@@ -26,10 +26,10 @@ TICKERS_PATH = os.getenv("TICKERS_PATH", "tickers_sa.txt")
 TP_PCT = float(os.getenv("TP_PCT", "0.05"))
 TOP10_WORKERS = int(os.getenv("TOP10_WORKERS", "10"))
 CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "600"))
-MIN_VOLUME = int(os.getenv("MIN_VOLUME", "250000"))      # تم التخفيض
-MIN_PRICE = float(os.getenv("MIN_PRICE", "5.0"))         # تم التخفيض
-ATR_EXCLUDE_PCT = float(os.getenv("ATR_EXCLUDE_PCT", "4.0"))  # تم الرفع
-MAX_5DAY_GAIN = float(os.getenv("MAX_5DAY_GAIN", "0.15"))      # تم الرفع
+MIN_VOLUME = int(os.getenv("MIN_VOLUME", "200000"))      # تم تخفيضه إلى 200,000
+MIN_PRICE = float(os.getenv("MIN_PRICE", "5.0"))          # ثابت
+ATR_EXCLUDE_PCT = float(os.getenv("ATR_EXCLUDE_PCT", "6.5"))  # رفع إلى 6.5%
+MAX_5DAY_GAIN = float(os.getenv("MAX_5DAY_GAIN", "0.15"))      # ثابت
 
 # ======================== كاش بسيط يدوي ========================
 _prices_cache = {}
@@ -38,7 +38,7 @@ _prices_cache = {}
 app = FastAPI(
     title="Tadawul Sniper Pro",
     description="محلل فني لأسهم السوق السعودي",
-    version="4.0.3"
+    version="4.0.4"  # رقم الإصدار محدث
 )
 
 app.add_middleware(
@@ -265,39 +265,53 @@ def has_bearish_pattern(feat_df):
 def should_exclude(feat_df: pd.DataFrame) -> tuple[bool, str]:
     """تحديد ما إذا كان السهم مستبعداً بناءً على معايير المخاطرة."""
     curr = feat_df.iloc[-1]
+    # 1. التقلب العالي (ATR%)
     if curr["atr_pct"] > ATR_EXCLUDE_PCT:
         return True, f"تقلب عالي (ATR% = {curr['atr_pct']:.1f}%)"
+    # 2. ارتفاع كبير في آخر 5 أيام
     if len(feat_df) >= 6:
         close_5 = feat_df["close"].iloc[-6]
         gain_5 = (curr["close"] / close_5 - 1)
         if gain_5 > MAX_5DAY_GAIN:
             return True, f"ارتفاع كبير في 5 أيام ({gain_5*100:.1f}%)"
+    # 3. سيولة منخفضة جداً
     if curr["volume"] < MIN_VOLUME:
         return True, f"سيولة منخفضة ({curr['volume']:,.0f})"
+    # 4. سعر منخفض جداً
     if curr["close"] < MIN_PRICE:
         return True, f"سعر منخفض جداً ({curr['close']:.2f})"
+    # 5. وجود نمط هابط
     if has_bearish_pattern(feat_df.tail(4)):
         return True, "وجود نمط هابط"
     return False, ""
 
-# ======================== الشروط الأساسية ========================
+# ======================== الشروط الأساسية (المعدلة) ========================
 def passes_core_rules(feat_df: pd.DataFrame) -> tuple[bool, list[str]]:
-    """الشروط الأساسية التي يجب توفرها للنظر في السهم."""
+    """الشروط الأساسية المعدلة بناءً على تحليل 2415 يومًا قويًا (نسخة التوازن)"""
     reasons = []
     curr = feat_df.iloc[-1]
-    if not (curr["close"] > curr["ema20"]):
-        reasons.append("السعر تحت EMA20")
+    
+    # 1. RSI (20-80)
+    if not (20 < curr["rsi14"] < 80):
+        reasons.append(f"RSI خارج النطاق ({curr['rsi14']:.1f})")
+    
+    # 2. حجم التداول (أكبر من 0.5x المتوسط)
+    if not (curr["volume"] > 0.5 * curr["vol_ma20"]):
+        reasons.append(f"حجم التداول أقل من 0.5x المتوسط ({curr['volume']/curr['vol_ma20']:.2f}x)")
+    
+    # 3. المسافة عن EMA20 (السماح بالارتدادات من تحت)
+    dist = (curr["close"] - curr["ema20"]) / curr["ema20"] * 100  # كنسبة مئوية
+    if not (-10 < dist < 11):
+        reasons.append(f"السعر بعيد جداً عن EMA20 ({dist:.1f}%)")
+    
+    # 4. الاتجاه العام (فوق SMA50)
     if not (curr["close"] > curr["sma50"]):
         reasons.append("السعر تحت SMA50")
-    if not (curr["macd"] > curr["macd_signal"]):
-        reasons.append("MACD أقل من Signal")
-    if not (curr["volume"] > 1.2 * curr["vol_ma20"]):
-        reasons.append("حجم التداول أقل من 1.2x المتوسط")
-    if not (30 < curr["rsi14"] < 75):
-        reasons.append(f"RSI خارج النطاق ({curr['rsi14']:.1f})")
-    dist = (curr["close"] - curr["ema20"]) / curr["ema20"]
-    if dist > 0.07:
-        reasons.append("السعر بعيد جداً عن المتوسط (>7%)")
+    
+    # 5. بعد فوق المتوسط (بعيد جداً) - اختياري لكنه مفيد
+    if dist > 11:
+        reasons.append("السعر بعيد جداً عن المتوسط (>11%)")
+    
     passed = len(reasons) == 0
     return passed, reasons
 
@@ -310,7 +324,6 @@ def calculate_group_scores(feat_df: pd.DataFrame) -> dict:
     scores = {}
 
     # 1. مجموعة الاتجاه (وزن 20)
-    # شرط القمم والقيعان الصاعدة: آخر 5 قمم متزايدة وآخر 5 قيعان متزايدة
     highs_5 = feat_df["high"].iloc[-5:].values
     lows_5 = feat_df["low"].iloc[-5:].values
     trend_hh = all(highs_5[i] > highs_5[i-1] for i in range(1, len(highs_5)))
@@ -325,20 +338,21 @@ def calculate_group_scores(feat_df: pd.DataFrame) -> dict:
 
     # 2. مجموعة الزخم (وزن 30)
     momentum_conditions = [
+        # تم إلغاء MACD > Signal كشرط أساسي، لكنه هنا في مجموعة الثقة
         curr["macd"] > curr["macd_signal"],
-        40 < curr["rsi14"] < 70,
+        20 < curr["rsi14"] < 80,
         curr["macd_hist"] > prev["macd_hist"],
         curr["stoch_k"] > curr["stoch_d"]
     ]
-    scores["momentum"] = round((sum(momentum_conditions) / len(momentum_conditions)) * 30, 2)
+    scores["momentum"] = round((sum(momentum_conditions) / 4) * 30, 2)  # 4 شروط
 
     # 3. مجموعة السيولة (وزن 25)
     volume_conditions = [
-        curr["volume"] > 1.2 * curr["vol_ma20"],
+        curr["volume"] > 0.5 * curr["vol_ma20"],
         curr["obv"] > prev["obv"],
         curr["volume"] > prev["volume"]
     ]
-    scores["volume"] = round((sum(volume_conditions) / len(volume_conditions)) * 25, 2)
+    scores["volume"] = round((sum(volume_conditions) / 3) * 25, 2)
 
     # 4. مجموعة الأنماط (وزن 15)
     scores["pattern"] = get_candle_pattern_score(feat_df)
@@ -361,7 +375,7 @@ def calculate_group_scores(feat_df: pd.DataFrame) -> dict:
             gap_up = 1
     near_ema = 1 if abs((curr["close"] - curr["ema20"]) / curr["ema20"]) < 0.02 else 0
     level_conditions = [fib_score, gap_up, near_ema]
-    scores["levels"] = round((sum(level_conditions) / len(level_conditions)) * 10, 2)
+    scores["levels"] = round((sum(level_conditions) / 3) * 10, 2)
 
     scores["total"] = round(scores["trend"] + scores["momentum"] + scores["volume"] + scores["pattern"] + scores["levels"], 2)
     return scores
@@ -433,32 +447,6 @@ def analyze_one(ticker: str) -> Optional[Dict[str, Any]]:
         "lastClose": entry
     }
 
-# ======================== دالة التحليل المبسطة للتشخيص ========================
-def analyze_one_debug(ticker: str):
-    """نسخة مبسطة من analyze_one لإرجاع الحالة والسبب فقط."""
-    t = ticker.strip().upper()
-    if not t.endswith(".SR"):
-        t += ".SR"
-
-    df = fetch_yahoo_prices(t)
-    if df is None:
-        return None
-
-    try:
-        feat_df = build_features(df)
-    except Exception:
-        return None
-
-    excluded, exclude_reason = should_exclude(feat_df)
-    if excluded:
-        return {"status": "EXCLUDED", "reason": exclude_reason, "recommendation": "NO_TRADE"}
-
-    passed, reasons = passes_core_rules(feat_df)
-    if not passed:
-        return {"status": "REJECTED", "reason": " | ".join(reasons), "recommendation": "NO_TRADE"}
-
-    return {"status": "APPROVED", "reason": "", "recommendation": "BUY"}
-    
 # ======================== Endpoints العامة ========================
 @app.get("/health")
 async def health_check():
