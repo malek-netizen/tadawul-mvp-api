@@ -27,18 +27,18 @@ TP_PCT = float(os.getenv("TP_PCT", "0.05"))
 TOP10_WORKERS = int(os.getenv("TOP10_WORKERS", "10"))
 CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "600"))
 
-# إعدادات استراتيجية الصعود
+# ======================== إعدادات استراتيجية الصعود (العودة إلى الحالة القديمة) ========================
 UPTREND_MIN_VOLUME = int(os.getenv("UPTREND_MIN_VOLUME", "200000"))
 UPTREND_MIN_PRICE = float(os.getenv("UPTREND_MIN_PRICE", "5.0"))
-UPTREND_ATR_LIMIT = float(os.getenv("UPTREND_ATR_LIMIT", "4.5"))
-UPTREND_RSI_MIN = float(os.getenv("UPTREND_RSI_MIN", "30"))
-UPTREND_RSI_MAX = float(os.getenv("UPTREND_RSI_MAX", "70"))
-UPTREND_VOL_RATIO = float(os.getenv("UPTREND_VOL_RATIO", "1.0"))
-UPTREND_DIST_MIN = float(os.getenv("UPTREND_DIST_MIN", "0.0"))
-UPTREND_DIST_MAX = float(os.getenv("UPTREND_DIST_MAX", "5.0"))
-UPTREND_REQUIRE_MACD = os.getenv("UPTREND_REQUIRE_MACD", "true").lower() == "true"
+UPTREND_ATR_LIMIT = float(os.getenv("UPTREND_ATR_LIMIT", "6.5"))  # العودة إلى 6.5 كما كانت سابقاً
+UPTREND_RSI_MIN = float(os.getenv("UPTREND_RSI_MIN", "20"))       # العودة إلى 20
+UPTREND_RSI_MAX = float(os.getenv("UPTREND_RSI_MAX", "80"))       # العودة إلى 80
+UPTREND_VOL_RATIO = float(os.getenv("UPTREND_VOL_RATIO", "0.5"))  # العودة إلى 0.5
+UPTREND_DIST_MIN = float(os.getenv("UPTREND_DIST_MIN", "-10.0"))  # العودة إلى -10%
+UPTREND_DIST_MAX = float(os.getenv("UPTREND_DIST_MAX", "11.0"))   # العودة إلى +11%
+UPTREND_REQUIRE_MACD = os.getenv("UPTREND_REQUIRE_MACD", "false").lower() == "true"  # العودة إلى False
 
-# إعدادات استراتيجية القيعان
+# ======================== إعدادات استراتيجية القيعان (كما هي) ========================
 BOTTOM_MIN_VOLUME = int(os.getenv("BOTTOM_MIN_VOLUME", "200000"))
 BOTTOM_MIN_PRICE = float(os.getenv("BOTTOM_MIN_PRICE", "5.0"))
 BOTTOM_ATR_LIMIT = float(os.getenv("BOTTOM_ATR_LIMIT", "6.0"))
@@ -59,7 +59,7 @@ _prices_cache = {}
 app = FastAPI(
     title="Tadawul Sniper Pro",
     description="محلل فني لأسهم السوق السعودي - يدعم استراتيجيتي الصعود واقتناص القيعان",
-    version="5.0.0"
+    version="5.0.1"  # تحديث الإصدار
 )
 
 app.add_middleware(
@@ -112,7 +112,7 @@ def fetch_yahoo_prices(ticker: str, range_: str = "1y", interval: str = "1d") ->
         logger.error(f"خطأ في جلب {ticker}: {str(e)}")
         return None
 
-# ======================== حساب المؤشرات الفنية (مع Bollinger Bands كاملة) ========================
+# ======================== حساب المؤشرات الفنية ========================
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
     close = d["close"]
@@ -177,8 +177,6 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     # أنماط انعكاسية مبسطة
     d["prev_close"] = close.shift(1)
     d["prev_open"] = d["open"].shift(1)
-    d["prev_low"] = low.shift(1)
-    d["prev_high"] = high.shift(1)
 
     # مطرقة (Hammer)
     body = d["body"]
@@ -254,7 +252,7 @@ def has_bearish_pattern(feat_df):
         return True
     return False
 
-# ======================== دوال حساب الثقة للصعود (مأخوذة من calculate_group_scores سابقاً) ========================
+# ======================== دوال حساب الثقة للصعود (العودة إلى الإصدار القديم) ========================
 def get_candle_pattern_score(feat_df):
     if len(feat_df) < 3:
         return 0
@@ -278,7 +276,7 @@ def get_candle_pattern_score(feat_df):
     return max(0, min(15, score))
 
 def calculate_uptrend_confidence(feat_df: pd.DataFrame) -> float:
-    """حساب الثقة للاستراتيجية الصاعدة (0-100)"""
+    """حساب الثقة للاستراتيجية الصاعدة (كما كانت سابقاً)"""
     curr = feat_df.iloc[-1]
     prev = feat_df.iloc[-2]
     scores = {}
@@ -306,7 +304,7 @@ def calculate_uptrend_confidence(feat_df: pd.DataFrame) -> float:
 
     # مجموعة السيولة (25)
     volume_conditions = [
-        curr["volume"] > curr["vol_ma20"],
+        curr["volume"] > UPTREND_VOL_RATIO * curr["vol_ma20"],
         curr["obv"] > prev["obv"],
         curr["volume"] > prev["volume"]
     ]
@@ -316,7 +314,6 @@ def calculate_uptrend_confidence(feat_df: pd.DataFrame) -> float:
     scores["pattern"] = get_candle_pattern_score(feat_df)
 
     # مجموعة المستويات (10)
-    # فيبوناتشي بسيط
     fib_score = 0
     if len(feat_df) > 60:
         recent_high = feat_df["high"].iloc[-60:].max()
@@ -339,41 +336,36 @@ def calculate_uptrend_confidence(feat_df: pd.DataFrame) -> float:
     total = scores["trend"] + scores["momentum"] + scores["volume"] + scores["pattern"] + scores["levels"]
     return total
 
-# ======================== حساب الثقة لاستراتيجية القيعان ========================
+# ======================== حساب الثقة لاستراتيجية القيعان (كما هي) ========================
 def calculate_bottom_confidence(feat_df: pd.DataFrame) -> float:
-    """حساب الثقة للاستراتيجية القاعية (0-100)"""
     curr = feat_df.iloc[-1]
-    prev = feat_df.iloc[-2]
 
     score = 0
-    # 1. النمط الانعكاسي (وزن كبير)
+    # 1. النمط الانعكاسي
     pattern_score = 0
     if curr.get("is_hammer", False):
         pattern_score = 30
     elif curr.get("is_bullish_engulfing", False):
         pattern_score = 30
     elif curr.get("is_doji", False):
-        pattern_score = 15  # دوجي أقل قوة
+        pattern_score = 15
     score += pattern_score
 
-    # 2. RSI (كلما قل، زادت النقاط)
+    # 2. RSI
     rsi = curr["rsi14"]
     if rsi < BOTTOM_RSI_MAX:
-        # نقاط تتناسب عكسياً مع RSI: مثلاً 20 نقطة إذا كان rsi=20، و0 إذا كان rsi=45
         rsi_points = max(0, BOTTOM_RSI_WEIGHT * (1 - (rsi - 20) / (BOTTOM_RSI_MAX - 20))) if rsi > 20 else BOTTOM_RSI_WEIGHT
         score += rsi_points
 
     # 3. حجم يوم النمط
     vol_ratio = curr.get("vol_ratio", 0)
     if vol_ratio >= BOTTOM_MIN_VOL_RATIO:
-        # كلما زاد الحجم، زادت النقاط حتى وزن معين
-        vol_points = min(BOTTOM_VOL_WEIGHT, vol_ratio * 5)  # 1x = 5 نقاط، 2x = 10، 3x = 15
+        vol_points = min(BOTTOM_VOL_WEIGHT, vol_ratio * 5)
         score += vol_points
 
-    # 4. المسافة تحت EMA20 (كلما كانت أكبر (أكثر سالباً)، زادت النقاط)
+    # 4. المسافة تحت EMA20
     dist = curr["dist_from_ema20"]
     if dist < 0:
-        # مثال: -2% تعطي 5 نقاط، -10% تعطي 15 نقطة
         dist_points = min(BOTTOM_DIST_WEIGHT, abs(dist) * 1.5)
         score += dist_points
 
@@ -381,20 +373,16 @@ def calculate_bottom_confidence(feat_df: pd.DataFrame) -> float:
     if curr["close"] <= curr["bb_lower"]:
         score += BOTTOM_BB_WEIGHT
     elif curr["close"] < curr["bb_mid"]:
-        # قريب من الحد السفلي ولكن ليس تحته
         score += BOTTOM_BB_WEIGHT // 2
-
-    # 6. (اختياري) تباعد إيجابي: السعر يصنع قاعاً أدنى و RSI قاعاً أعلى خلال آخر 5 أيام
-    # يمكن إضافته لاحقاً
 
     return min(100, max(0, score))
 
-# ======================== شروط القبول للصعود ========================
+# ======================== شروط القبول للصعود (العودة إلى الإصدار القديم) ========================
 def passes_uptrend(feat_df: pd.DataFrame) -> Tuple[bool, List[str]]:
     reasons = []
     curr = feat_df.iloc[-1]
 
-    # شروط أساسية
+    # شروط أساسية قديمة
     if not (UPTREND_RSI_MIN < curr["rsi14"] < UPTREND_RSI_MAX):
         reasons.append(f"RSI خارج {UPTREND_RSI_MIN}-{UPTREND_RSI_MAX}")
     if not (curr["volume"] > UPTREND_VOL_RATIO * curr["vol_ma20"]):
@@ -407,43 +395,37 @@ def passes_uptrend(feat_df: pd.DataFrame) -> Tuple[bool, List[str]]:
     if UPTREND_REQUIRE_MACD and not (curr["macd"] > curr["macd_signal"]):
         reasons.append("MACD أقل من Signal")
 
-    # شروط استبعاد أساسية
+    # شروط استبعاد أساسية (بقيت كما هي)
     if curr["volume"] < UPTREND_MIN_VOLUME:
         reasons.append(f"حجم < {UPTREND_MIN_VOLUME}")
     if curr["close"] < UPTREND_MIN_PRICE:
         reasons.append(f"سعر < {UPTREND_MIN_PRICE}")
     if curr["atr_pct"] > UPTREND_ATR_LIMIT:
         reasons.append(f"تقلب > {UPTREND_ATR_LIMIT}%")
-    if has_bearish_pattern(feat_df.tail(4)):
-        reasons.append("نمط هابط")
+    # تم إزالة شرط has_bearish_pattern لأنه لم يكن موجوداً في القديم
 
     passed = len(reasons) == 0
     return passed, reasons
 
-# ======================== شروط القبول للقيعان ========================
+# ======================== شروط القبول للقيعان (كما هي) ========================
 def passes_bottom(feat_df: pd.DataFrame) -> Tuple[bool, List[str]]:
     reasons = []
     curr = feat_df.iloc[-1]
 
-    # 1. RSI منخفض
     if curr["rsi14"] > BOTTOM_RSI_MAX:
         reasons.append(f"RSI > {BOTTOM_RSI_MAX}")
 
-    # 2. المسافة تحت EMA20 ضمن النطاق
     dist = curr["dist_from_ema20"]
     if not (BOTTOM_DIST_MIN <= dist <= BOTTOM_DIST_MAX):
         reasons.append(f"المسافة عن EMA20 خارج [{BOTTOM_DIST_MIN},{BOTTOM_DIST_MAX}]%")
 
-    # 3. وجود نمط انعكاسي
     has_pattern = curr.get("is_hammer", False) or curr.get("is_bullish_engulfing", False) or curr.get("is_doji", False)
     if not has_pattern:
-        reasons.append("لا يوجد نمط انعكاسي (مطرقة، ابتلاع، دوجي)")
+        reasons.append("لا يوجد نمط انعكاسي")
 
-    # 4. حجم يوم النمط (نسبة إلى المتوسط)
     if curr["vol_ratio"] < BOTTOM_MIN_VOL_RATIO:
         reasons.append(f"حجم يوم النمط < {BOTTOM_MIN_VOL_RATIO}x المتوسط")
 
-    # شروط استبعاد أساسية
     if curr["volume"] < BOTTOM_MIN_VOLUME:
         reasons.append(f"حجم < {BOTTOM_MIN_VOLUME}")
     if curr["close"] < BOTTOM_MIN_PRICE:
@@ -451,12 +433,10 @@ def passes_bottom(feat_df: pd.DataFrame) -> Tuple[bool, List[str]]:
     if curr["atr_pct"] > BOTTOM_ATR_LIMIT:
         reasons.append(f"تقلب > {BOTTOM_ATR_LIMIT}%")
 
-    # لا نستبعد الأنماط الهابطة هنا لأننا نبحث عن القيعان
-
     passed = len(reasons) == 0
     return passed, reasons
 
-# ======================== دالة التحليل الرئيسية (تنتج نتائج لكلتا الاستراتيجيتين) ========================
+# ======================== دالة التحليل الرئيسية ========================
 def analyze_one(ticker: str) -> Optional[Dict[str, Any]]:
     t = ticker.strip().upper()
     if not t.endswith(".SR"):
@@ -511,18 +491,37 @@ def analyze_one(ticker: str) -> Optional[Dict[str, Any]]:
         "bottom": bottom_result
     }
 
-# ======================== Endpoints ========================
-@app.get("/health")
-async def health_check():
-    return {"status": "ok", "timestamp": time.time()}
-
+# ======================== نقطة النهاية القديمة (للتوافق) ========================
 @app.get("/predict")
 async def predict(ticker: str = Query(..., description="رمز السهم مثال: 2222.SR")):
+    """نقطة النهاية القديمة - تعيد بيانات استراتيجية الصعود فقط (بنفس التنسيق السابق)"""
+    result = analyze_one(ticker)
+    if result is None:
+        raise HTTPException(status_code=404, detail="لا توجد بيانات كافية لهذا السهم")
+    # نعيد فقط بيانات الصعود مع الحقول المطلوبة من الواجهة القديمة
+    uptrend = result["uptrend"]
+    return {
+        "ticker": result["ticker"],
+        "status": uptrend["status"],
+        "recommendation": "BUY" if uptrend["status"] == "APPROVED" else "NO_TRADE",
+        "confidence": uptrend["confidence"],
+        "entry": uptrend["entry"],
+        "tp": uptrend["tp"],
+        "sl": uptrend["sl"],
+        "reason": uptrend["reason"],
+        "lastClose": result["lastClose"]
+    }
+
+# ======================== نقطة نهاية جديدة للاستراتيجيتين ========================
+@app.get("/predict/dual")
+async def predict_dual(ticker: str = Query(..., description="رمز السهم مثال: 2222.SR")):
+    """نقطة نهاية جديدة تعيد بيانات كلتا الاستراتيجيتين"""
     result = analyze_one(ticker)
     if result is None:
         raise HTTPException(status_code=404, detail="لا توجد بيانات كافية لهذا السهم")
     return result
 
+# ======================== نقطة نهاية top10 المعدلة ========================
 @app.get("/top10")
 async def top10():
     if not os.path.exists(TICKERS_PATH):
