@@ -405,18 +405,16 @@ def predict_ai(feat_df: pd.DataFrame) -> float:
         return 0.0
 
     curr = feat_df.iloc[-1]
-    # استخراج المؤشرات بنفس الترتيب الذي تم تدريب النموذج عليه
-    # هذا يجب أن يطابق الميزات المستخدمة في التدريب (feature_cols)
+    # استخراج المؤشرات بنفس الترتيب الذي تم تدريب النموذج عليه (9 ميزات)
     features = np.array([[
         curr.get("rsi14", 0),
-        curr.get("vol_ratio", 0),
+        curr.get("vol_ratio", 0),                     # نسبة الحجم (ميزة 2)
         curr.get("dist_from_ema20", 0),
         curr.get("atr_pct", 0),
         curr.get("macd_hist", 0),
         curr.get("stoch_k", 0),
         curr.get("obv", 0),
         curr.get("close", 0) / curr.get("sma50", 1) - 1,  # البعد عن SMA50
-        curr.get("volume", 0) / curr.get("vol_ma20", 1),  # نسبة الحجم (مكرر؟ لكن ممكن)
         curr.get("macd", 0) - curr.get("macd_signal", 0)   # فرق MACD
     ]]).reshape(1, -1)
 
@@ -426,7 +424,6 @@ def predict_ai(feat_df: pd.DataFrame) -> float:
     except Exception as e:
         logger.error(f"خطأ في التنبؤ بالذكاء الاصطناعي: {e}")
         return 0.0
-
 # ======================== شروط القبول للصعود ========================
 def passes_uptrend(feat_df: pd.DataFrame) -> Tuple[bool, List[str]]:
     reasons = []
