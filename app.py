@@ -381,8 +381,9 @@ def calculate_bottom_confidence(feat_df: pd.DataFrame) -> float:
 def passes_uptrend(feat_df: pd.DataFrame) -> Tuple[bool, List[str]]:
     reasons = []
     curr = feat_df.iloc[-1]
+    prev = feat_df.iloc[-2] if len(feat_df) > 1 else curr
 
-    # شروط أساسية قديمة
+    # الشروط الحالية (RSI، حجم، مسافة، SMA50، MACD، ...)
     if not (UPTREND_RSI_MIN < curr["rsi14"] < UPTREND_RSI_MAX):
         reasons.append(f"RSI خارج {UPTREND_RSI_MIN}-{UPTREND_RSI_MAX}")
     if not (curr["volume"] > UPTREND_VOL_RATIO * curr["vol_ma20"]):
@@ -395,14 +396,32 @@ def passes_uptrend(feat_df: pd.DataFrame) -> Tuple[bool, List[str]]:
     if UPTREND_REQUIRE_MACD and not (curr["macd"] > curr["macd_signal"]):
         reasons.append("MACD أقل من Signal")
 
-    # شروط استبعاد أساسية (بقيت كما هي)
+    # 🆕 شروط اتجاه المؤشرات
+    # 1. RSI في ارتفاع (أو على الأقل ليس في هبوط حاد)
+    if curr["rsi14"] < prev["rsi14"] - 5:  # انخفض بأكثر من 5 نقاط
+        reasons.append(f"RSI في هبوط حاد ({prev['rsi14']:.1f} → {curr['rsi14']:.1f})")
+    
+    # 2. MACD Histogram في ارتفاع
+    if curr["macd_hist"] < prev["macd_hist"]:
+        reasons.append("MACD Histogram في هبوط")
+    
+    # 3. Stochastic في حالة إيجابية (%K فوق %D)
+    if curr["stoch_k"] < curr["stoch_d"]:
+        reasons.append("تقاطع Stochastic سلبي (%K تحت %D)")
+    
+    # 4. OBV في ارتفاع (تدفق سيولة إيجابي)
+    if curr["obv"] < prev["obv"]:
+        reasons.append("OBV في هبوط")
+
+    # شروط استبعاد أساسية
     if curr["volume"] < UPTREND_MIN_VOLUME:
         reasons.append(f"حجم < {UPTREND_MIN_VOLUME}")
     if curr["close"] < UPTREND_MIN_PRICE:
         reasons.append(f"سعر < {UPTREND_MIN_PRICE}")
     if curr["atr_pct"] > UPTREND_ATR_LIMIT:
         reasons.append(f"تقلب > {UPTREND_ATR_LIMIT}%")
-    # تم إزالة شرط has_bearish_pattern لأنه لم يكن موجوداً في القديم
+    if has_bearish_pattern(feat_df.tail(4)):
+        reasons.append("نمط هابط")
 
     passed = len(reasons) == 0
     return passed, reasons
